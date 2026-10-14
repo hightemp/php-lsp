@@ -6723,3 +6723,7 @@ change.
 - [x] **P238-004-2026-10-14** Preserve the finding, append status/results directly under P2-38, update relevant documentation and complete the milestone. *(done 2026-10-14)*
   - Implemented: status directly under original audit finding; README, architecture, LSP matrix and test-evidence matrix updated. Existing audit/journal text preserved, local links checked; historical coverage percentages and production timings were not remeasured.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.
+
+- [x] **AUD-CODELENS-BACKLOG-2026-10-14** Append eight separate planned Code Lens capability tasks to the end of audit/CODEX-AUDIT-2026-08-26.md, preserving existing findings and defining scope and acceptance checks for each. *(done 2026-10-14)*
+  - Implemented: CODEX-CL-01..08 cover additional symbol counters, refresh, lazy resolve, request caching/coalescing, hierarchy lenses, PHPUnit/Pest run/debug, display settings and source-mapped template references. All eight remain planned; each has scope and acceptance criteria.
+  - Validation: original audit/journal prefixes preserved byte-for-byte; eight unique task IDs and pending statuses, local source links and git diff --check verified. Documentation-only change; no builds or runtime changes.
