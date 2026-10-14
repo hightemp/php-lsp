@@ -118,3 +118,6 @@ async fn call_graph_rejects_closed_to_open_transition_and_superseded_index_befor
     index.remove_file(uri);
     assert!(!graph.is_current(backend, &index));
 }
+
+#[path = "call_hierarchy_scope_tests.rs"]
+mod scope_tests;

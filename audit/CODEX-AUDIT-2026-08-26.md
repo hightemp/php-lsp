@@ -2551,6 +2551,62 @@ Incoming path использует receiver-неточный legacy walker (P2-1
 callable boundaries для всех пяти callable forms и строить обе стороны из
 resolved reference graph.
 
+**Статус (2026-10-14): выполнено через TDD; исторические и остаточные случаи проверены.**
+
+Повторная проверка показала, что основные исторические утверждения уже
+устранены P2-18: incoming/outgoing используют `call_hierarchy_graph.rs`,
+metadata `call_site.caller_range` учитывает nested callable boundaries,
+nullsafe вызовы поддержаны, first-class callable creation не становится
+invocation. Существующие и новые регрессии это подтверждают; старый walker
+заново не реализовывался.
+
+Оставался воспроизведённый дефект `prepareCallHierarchy`: fallback использовал
+`containing_callable_symbol` по широкому диапазону именованного символа.
+На локальной переменной внутри closure, arrow, nested function без символа
+или тела anonymous class выбирался внешний метод. Теперь ближайшая область
+определяется существующим CST `variable_scope::lexical_scope`; её точный
+byte-range должен совпасть с function/method symbol из того же
+`OpenDocumentSnapshot`. Явный именованный callee внутри closure по-прежнему
+разрешается независимо от fallback.
+
+Дополнительный RED обнаружил recovery-случай `$f = fn $inside;`: Tree-sitter
+оставляет `ERROR` соседним узлом в assignment, не создавая callable wrapper.
+Fallback отвергает выражение с recovery errors на пути к scope/body, сохраняя
+здоровые соседние statements. Проверены также незавершённые `function`/`fn`
+с телом и ошибками параметров/use. Синтетические hierarchy items для closures
+и новый вывод динамических вызовов не добавлены. Parser/reference metadata,
+resolved graph, cache schema 38 и публичные LSP-настройки не менялись.
+
+TDD: первоначальный **4 FAIL / 2 PASS** стал **6/6 PASS**; расширение recovery
+matrix дало **1 FAIL / 7 PASS**, затем **8/8 PASS**. Ещё три malformed-body
+controls прошли без изменения production fix. В итоге добавлены **12
+постоянных тестов**: 10 LSP и 2 graph/cache. Они проверяют static/non-static
+closures, arrow parameters/body, nested arrows/functions/classes, capture/use,
+границы `{`/`}`/продолжение после `};`, comments, аргументы anonymous-class
+constructor, explicit callee, incoming/outgoing и same-line emoji/CRLF.
+
+Двадцать четыре ограниченных раунда перекрывающихся prepare/edit futures
+меняют порядок polling: допустим только целый прежний item или `null`, затем
+проверяются точные актуальный и reopened результаты. Отдельные snapshot checks
+отвергают edit, close/reopen с тем же LSP version и reindex. Это конечное
+покрытие порядков событий, не доказательство всех interleavings. Реальный
+binary cache сохраняет caller boundaries; после загрузки PHP source удаляется,
+а graph всё равно получает только ожидаемые resolved outer edges без reparse.
+
+Адресно прошли **6 graph unit** и **26 hierarchy protocol** проверок.
+Полный `cargo test --all`: **1871 PASS, 0 FAIL, 0 ignored**, 61 result blocks
+(`all.log`). Clippy `--all-targets -- -D warnings`, Rustfmt и diff check
+прошли. Read-only Verifier на **gpt-6-astra** дал итоговый **GO** после
+проверки production diff, 12 новых тестов, логов, совпадения SHA256 четырёх
+Rust-файлов и документации. Проверены 69 строк матрицы / 174 локальные ссылки;
+milestone P2-36 завершён в TASKS.md. Артефакты: `server/target/p2-36-2026-10-14/` (ignored).
+Все Rust-проверки последовательные: один CPU, `CARGO_BUILD_JOBS=1`,
+`--test-threads=1`, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M;
+CLI server-package debug=0 сохраняет assertions. README, архитектура,
+feature/coverage matrices актуализированы; исходный finding и остальные
+разделы аудита сохранены. Процентное покрытие и performance baseline
+не пересчитывались.
+
 ### CODEX-P2-37. Completion теряет документацию и оставляет конфликтный short name
 
 При конвертации completion items в

@@ -156,6 +156,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_linked_editing.rs` | import-role pairs, independent namespace/path names, group/comma ambiguity and import kinds, malformed imports, UTF-16/CRLF and document updates/isolation. |
 | `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
 | `tests/e2e_call_hierarchy_receivers.rs` | receiver/declaration identity, inheritance/private/trait access, unknown targets, nullsafe/constructor/recursive calls, first-class callable exclusions and UTF-16/CRLF updates. |
+| `tests/e2e_call_hierarchy_scopes.rs` | prepare scope barriers, syntax recovery, incoming/outgoing owner ranges, nullsafe and anonymous-class argument calls, and bounded prepare/edit/close/reopen orders. |
 | `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
 | `tests/e2e_inference_budget.rs` | bounded unknown receiver chains, cold/warm completion, asserted cache hits and exact references in a closed file before didOpen. |
 | `tests/e2e_inference_bindings.rs` | reaching foreach writes, captures, writable/destructured targets, hover/definition/completion/references/inlays, close-to-disk restoration and bounded concurrent edit/definition rounds. |
@@ -423,6 +424,16 @@ extracted global/class/enum identity. Enum-case queries accept class-constant
 access syntax while keeping owner, member spelling and other symbol kinds
 distinct. Dynamic member expressions do not fabricate a static member target;
 their class scopes and constant expressions remain references.
+
+Call-hierarchy preparation resolves an explicit named callee independently of
+containing-callable fallback. That fallback selects the nearest CST lexical
+scope and requires its exact byte range in the same open-document symbol
+snapshot. Anonymous/arrow bodies, anonymous class bodies and unrepresented
+nested functions cannot borrow the outer declaration's wider range. An
+expression containing syntax-recovery errors cannot prove its caller scope;
+healthy sibling statements and anonymous-class constructor arguments keep their
+ordinary enclosing callable. The fallback uses the shared lexical-scope helper
+and does not synthesize new hierarchy symbols for anonymous functions.
 
 Call hierarchy uses each reference's invocation kind and byte range of its
 owning named callable. Reference locations stay in UTF-16. First-class callable

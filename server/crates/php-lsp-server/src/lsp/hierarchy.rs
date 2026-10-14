@@ -562,9 +562,40 @@ impl PhpLspBackend {
                     .find(|sym| sym.fqn == *fqn && is_call_hierarchy_symbol_kind(sym.kind))
                     .cloned()
             });
-            let point_range = (pos.line, byte_col, pos.line, byte_col);
-            let containing_candidate =
-                containing_callable_symbol(&file_symbols, point_range).cloned();
+            // Symbol ranges alone span nested anonymous/unrepresented callables.
+            // Use the nearest lexical scope from this same document snapshot,
+            // then require its exact named declaration in the symbol table.
+            let point = tree_sitter::Point::new(pos.line as usize, byte_col as usize);
+            let containing_candidate = tree
+                .root_node()
+                .descendant_for_point_range(point, point)
+                .filter(|node| {
+                    // Recovery may leave `fn`/`function` in an ERROR sibling
+                    // inside an assignment rather than creating a callable node.
+                    // Reject that expression, without rejecting healthy sibling
+                    // statements elsewhere in the enclosing function body.
+                    let mut part = *node;
+                    while !php_lsp_parser::variable_scope::is_callable_scope(part)
+                        && part.kind() != "compound_statement"
+                    {
+                        if part.has_error() {
+                            return false;
+                        }
+                        let Some(parent) = part.parent() else {
+                            break;
+                        };
+                        part = parent;
+                    }
+                    true
+                })
+                .map(php_lsp_parser::variable_scope::lexical_scope)
+                .and_then(|scope| {
+                    file_symbols.symbols.iter().find(|symbol| {
+                        is_call_hierarchy_symbol_kind(symbol.kind)
+                            && symbol.range == node_range_node(scope)
+                    })
+                })
+                .cloned();
             (
                 candidate,
                 local_candidate,

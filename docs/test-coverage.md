@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35 (2026-10-14).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35/P2-36 (2026-10-14).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -74,6 +74,7 @@ percentages have not been remeasured.
 | Static document links | include/require targets | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Semantic tokens | full → delta and range requests | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Call/type hierarchy | receiver/private/trait identity, nullsafe/cached calls, snapshot changes, super/subtypes | T | B | B | [call-graph tests](../server/crates/php-lsp-server/src/lsp/call_hierarchy_graph_tests.rs), [receiver protocol tests](../server/crates/php-lsp-server/tests/e2e_call_hierarchy_receivers.rs), [hierarchy protocol tests](../server/crates/php-lsp-server/tests/e2e_hierarchy.rs). |
+| Call hierarchy callable ownership | closures/static closures, arrows/nested arrows, unrepresented nested functions/classes, recovery errors, constructor arguments, UTF-16/CRLF, cache replay and document lifetime | T | B | B | [scope protocol tests](../server/crates/php-lsp-server/tests/e2e_call_hierarchy_scopes.rs), [cache and snapshot tests](../server/crates/php-lsp-server/src/lsp/call_hierarchy_scope_tests.rs). Twenty-four bounded prepare/edit rounds vary polling order and accept only a complete old item or no item, then check the exact latest/reopened state. Deterministic graph checks reject edits, close/reopen with a reused version and reindex; cache replay removes the source before consuming resolved edges. This is finite event-order coverage, not every scheduling interleaving. |
 | Blade virtual PHP | escaped client echoes, PHP feature suppression/restoration, hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs), [conversion unit tests](../server/crates/php-lsp-server/src/template_conversion_tests.rs), [conversion protocol tests](../server/crates/php-lsp-server/tests/e2e_template_conversion.rs). |
 | Twig virtual PHP and context | numeric tokens, key/value loops, exact UTF-16/CRLF ranges; controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs), [conversion protocol tests](../server/crates/php-lsp-server/tests/e2e_template_conversion.rs). |
 | Twig include inheritance | plain/with/only, explicit replacement and provenance, inert/dynamic syntax, unsaved removal/close/watched edits, roots/aliases/exclusions, ordered cancellation and warm-cache reuse | T | B | B | [include unit tests](../server/crates/php-lsp-server/src/lsp/twig_include_tests.rs), [index lifecycle tests](../server/crates/php-lsp-server/src/indexing/twig_include_context_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_include_context.rs). Exact UTF-16/CRLF targets are checked; a paused worker is superseded by an unsaved `only` edit, and counters retain the 4000-source cold / zero-new-work warm contract. One include level only; caller-union and framework-eligibility evidence is listed separately below. |
@@ -123,7 +124,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
@@ -172,9 +173,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 68 scenario rows: on Linux 59 have executed tests, seven have
+The matrix has 69 scenario rows: on Linux 60 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 59 Rust rows have macOS/Windows
+has no automated test or build evidence. The 60 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

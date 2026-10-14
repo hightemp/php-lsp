@@ -6672,3 +6672,20 @@ change.
 - [x] **P235-004-2026-10-14** Preserve the original audit finding, append status/results within P2-35, update relevant feature/architecture/coverage documentation and finish the milestone. *(done 2026-10-14)*
   - Implemented: current semantics and static Composer detection limits are documented in README, architecture and feature matrix. The coverage matrix has 68 rows / 172 valid local links. Original audit text and the previous TASKS prefix remain unchanged; historical coverage percentages and performance samples were not remeasured.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CODEX-P2-36 Call hierarchy callable boundaries (2026-10-14 -> 2026-10-14)
+
+**Статус:** complete *(done 2026-10-14)*
+**Цель:** Attribute incoming/outgoing calls to their actual callable owner and prevent nested anonymous/arrow bodies from leaking into an outer method's call hierarchy.
+
+#### Задачи
+
+- [x] **P236-001-2026-10-14** Recheck the historical finding against the current resolved call graph and add RED/adversarial regressions for nested callable boundaries, nullsafe calls and exact UTF-16 caller ranges. *(done 2026-10-14)*
+  - Implemented: 12 permanent tests (10 LSP, 2 graph/cache). Initial RED 4 FAIL / 2 PASS identifies prepare fallback leaks; recovery RED 1 FAIL / 7 PASS covers an ERROR sibling. Historical resolved incoming/outgoing/nullsafe behavior is already fixed by P2-18 and remains covered.
+- [x] **P236-002-2026-10-14** Fix remaining scope-owner gaps using existing CST/reference metadata; preserve receiver identity, constructor behavior, closed-cache data and conservative unsupported-callable handling. *(done 2026-10-14)*
+  - Implemented: prepare fallback uses the nearest shared CST lexical scope and an exact named-symbol range from one snapshot. Recovery expressions cannot borrow an outer owner; healthy siblings, anonymous-class constructor arguments and explicit callees remain supported. Parser/graph metadata and schema 38 are unchanged.
+- [x] **P236-003-2026-10-14** Cover LSP prepare/incoming/outgoing, document lifecycle and controlled concurrent event orders; run focused then full sequential Rust checks and repeat gpt-6-astra Verifier until GO. *(done 2026-10-14)*
+  - Validation: 6 graph unit / 26 hierarchy protocol checks pass; full Rust suite 1871 PASS / 0 FAIL / 0 ignored across 61 blocks. Twenty-four bounded overlapping prepare/edit rounds check whole old/new results and exact latest/reopened state; graph snapshots reject edits, reused-version reopen and reindex. Clippy -D warnings, Rustfmt and diff check pass; final read-only gpt-6-astra Verifier returned GO after source-hash, code, test-log and documentation review.
+- [x] **P236-004-2026-10-14** Preserve the original finding, add status/evidence directly under P2-36, update relevant documentation and complete the milestone. *(done 2026-10-14)*
+  - Implemented: audit distinguishes the historical P2-18 fixes from the newly fixed prepare fallback. Original finding and prior journal remain unchanged. README, architecture/features and coverage updated; 69 matrix rows / 174 valid local links. Historical coverage percentages/performance timing unchanged.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.

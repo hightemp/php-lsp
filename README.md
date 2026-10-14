@@ -125,7 +125,8 @@ phpstorm-stubs support.
   signatures and deprecation tags.
 - Ranked workspace symbol search over the indexed workspace.
 - Call hierarchy for functions, methods, constructors, incoming calls, and
-  outgoing calls.
+  outgoing calls. Containing-callable lookup respects nested closure/arrow
+  scopes; unsupported anonymous owners do not select the outer method.
 - Type hierarchy for classes, interfaces, traits, enums, supertypes, and
   subtypes.
 
