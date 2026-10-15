@@ -146,7 +146,9 @@ phpstorm-stubs support.
 - Source action to organize imports.
 - Quick fix to implement missing interface, abstract parent, and abstract trait
   methods while preserving PHPDoc, analyzer tags, attributes, visibility,
-  static, params, defaults, and native-safe return types.
+  static, reference returns, params, supported defaults, and native-safe return
+  types. Inherited names retain their original namespace identity; unresolved
+  or conflicting contracts are omitted.
 - Refactor actions to generate constructors and property getters/setters from
   indexed properties.
 - Refactor actions to change member visibility and promote simple constructor
@@ -158,8 +160,9 @@ phpstorm-stubs support.
 - Refactor actions to extract selected expressions to local variables, extract
   class-scope literals to constants, and inline simple same-block local
   variables.
-- Heavy refactor edits use `codeAction/resolve` so initial code-action requests
-  stay lightweight.
+- Refactor edits use `codeAction/resolve`; inherited methods are validated both
+  when proposed and when resolved. Clients supporting versioned workspace edits
+  receive the expected document version.
 - Document formatting, range formatting, and on-type formatting through
   auto-detected or configured external formatters (`pint`, `php-cs-fixer`,
   `phpcbf`, or a custom command).

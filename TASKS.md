@@ -6744,3 +6744,20 @@ change.
 - [x] **P239-004-2026-10-14** Preserve the original audit finding, document which namespace behavior was already fixed, append completion evidence under P2-39 and update relevant feature/architecture/test documentation. *(done 2026-10-14)*
   - Implemented: README, architecture, LSP matrix and test-evidence matrix describe normalized 1:1 responses, original template coordinates and the response-depth limit. Original audit/journal and Code Lens backlog preserved; 181 coverage links verified. No historical coverage/performance claims were refreshed.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M. CLI server-package debug=0 overrides retain assertions. No parallel heavy checks, installed/remote changes or automatic commit.
+
+### Milestone: CODEX-P2-40 Structural code-action edits (2026-10-15 -> 2026-10-15)
+
+**Статус:** complete *(done 2026-10-15)*
+**Цель:** Build safe CST-backed visibility/import/analyzer-ignore edits and preserve declaration identity when generating inherited method contracts in another namespace.
+
+#### Задачи
+
+- [x] **P240-001-2026-10-15** Add RED applied-edit regressions for visibility token decoys, inline/group imports, multiline analyzer targets and cross-namespace inherited signatures/defaults/attributes. *(done 2026-10-15)*
+  - Implemented: 39 regressions (18 server unit, 19 LSP, 2 types unit). RED evidence covers source-token corruption, foreign contract identity, PHPDoc continuations/indentation, stale dependency publication and PHP-version gates; existing summary/metadata expectations remain unchanged.
+- [x] **P240-002-2026-10-15** Replace unsafe raw-text edits with existing/new focused CST helpers and qualify inherited contracts conservatively; preserve supported cases and refuse ambiguous transformations. *(done 2026-10-15)*
+  - Implemented: CST modifier/import/ignore plans, current semantic/PHPDoc usedness, source-backed ancestor/trait contracts, bounded structural type relocation and declaration-time aliases. Unprovable contracts are omitted. Resolve checks lifetime/runtime/index/dependency states; supporting clients receive versioned edits. No settings/cache-schema changes.
+- [x] **P240-003-2026-10-15** Cover exact edited PHP, UTF-16/CRLF, aliases/namespaces, malformed inputs and lazy resolve edit/reopen/dependency changes; run focused/full sequential gates and repeated gpt-6-astra Verifier to GO. *(done 2026-10-15)*
+  - Validation: deterministic worker/final-publication barriers cover edit/reopen, donor/consumer/index/runtime changes and cancellation permit ownership. Full Rust suite 1954 PASS / 0 FAIL / 0 ignored (66 blocks); after two equivalent lint cleanups, server unit and affected LSP suites pass again (682 PASS). Clippy -D warnings, Rustfmt and diff check PASS. Repeated read-only gpt-6-astra Verifier GO; 11 final source hashes and the two equivalent lint changes verified. Artifacts in server/target/p2-40-2026-10-15/ (ignored).
+- [x] **P240-004-2026-10-15** Preserve the original P2-40 finding, append implementation/status at that section, update relevant documentation and complete this milestone. *(done 2026-10-15)*
+  - Implemented: README, architecture, LSP and test-evidence matrices describe source-safe edits, supported inherited contracts and limits. The original finding, other audit sections/Code Lens backlog and prior journal are preserved; 184 coverage links verified. Historical coverage percentages and production timings unchanged.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M; server-package CLI debug=0 overrides retain assertions. No parallel heavy checks, installed/remote changes or automatic commit.

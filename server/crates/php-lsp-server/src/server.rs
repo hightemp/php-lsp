@@ -2823,6 +2823,8 @@ pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
     client: Client,
     code_lens_control: Arc<lsp::references::CodeLensControl>,
+    /// Whether workspace edits may carry the exact document version.
+    document_changes_supported: AtomicBool,
     /// Open document parsers (URI string → FileParser).
     open_files: Arc<DashMap<String, FileParser>>,
     /// Open Blade-like template documents backed by virtual PHP parsers.
@@ -2954,6 +2956,7 @@ impl PhpLspBackend {
         PhpLspBackend {
             client: client.clone(),
             code_lens_control: Arc::new(lsp::references::CodeLensControl::default()),
+            document_changes_supported: AtomicBool::new(false),
             open_files,
             template_documents,
             document_versions,

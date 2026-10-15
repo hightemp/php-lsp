@@ -2815,6 +2815,60 @@ source-relative type/default/attribute text из parent namespace в child бе�
 уровне clause, ignore привязывать к statement, а inherited signatures сначала
 нормализовать в FQN и затем безопасно импортировать/сокращать в target scope.
 
+**Статус: исправлено (2026-10-15).**
+Исходное описание finding сохранено. В `lsp/code_action_source.rs` edits
+выбирают CST modifier/clause/statement, сохраняя тела методов, литералы,
+атрибуты, соседние imports/statements и комментарии. Удаление import повторно
+проверяет текущие references и PHPDoc, включая namespace-prefix uses в
+function/constant calls. Bulk organize отказывается от неподдерживаемого
+блока с inline code/comments. Psalm suppression объединяется с attached
+PHPDoc; PHPStan marker предлагается только для первой строки owner без
+вытеснения attached PHPDoc. Неподдерживаемое размещение не создаёт action.
+
+`lsp/inherited_method_contracts.rs` проверяет source provenance всех ancestor
+и trait consumer declarations, переносит native/PHPDoc types, defaults и
+attributes с сохранением namespace identity, `&`, static, DNF grouping и
+содержимого строк. Учитываются declaration-time imports, method templates,
+prefixed/multiline PHPDoc и `self`/`parent` у trait consumer. Противоречивые
+same-name contracts, неизвестные ancestors, trait adaptations, unbound class
+templates/aliases, неизвестные annotation DSL, непереносимые defaults и
+неподдерживаемая PHP-версия приводят к отказу от генерации.
+
+Hierarchy/source work выполняется cancellable blocking helpers с общим
+бюджетом 15 секунд, по одному donor source/tree за раз. Closed source сверяется
+с indexed fingerprint и повторно читается для проверки. После последнего
+await проверяются runtime generation, index revision и document states
+target/dependencies; reopen с тем же version тоже инвалидирует action.
+Поддерживающие `workspaceEdit.documentChanges` клиенты получают versioned
+edits. Это snapshot validation, не атомарная транзакция с внешним filesystem.
+Настроек и изменений cache schema нет.
+
+**TDD:** 39 новых тестов (18 server unit, 19 LSP, 2 types unit). RED выявили
+raw modifier/import/ignore edits, перенос чужих types/constants/attributes,
+устаревший resolve, namespace-prefix/PHPDoc uses, несовместимые contracts,
+PHP-version gaps и multiline/indented PHPDoc. Applied-edit проверки сохраняют
+соседний PHP и проверяют синтаксис; protocol tests проверяют конкретные
+qualified signatures/defaults/attributes. Управляемые barriers покрывают
+edit/reopen, donor/consumer changes, index/runtime replacement, окно перед
+финальной публикацией и удержание permit до выхода отменённого worker.
+Это конечное покрытие порядков событий, не доказательство всех interleavings.
+Существующие 23 code-action и 8 constructor protocol-тестов проходят без
+ослабления ожиданий. PHPStan/Psalm executables для marker placement не запускались.
+
+**Проверки:** полный `cargo test --all` — **1954 PASS, 0 FAIL, 0 ignored**
+(66 result blocks). После двух эквивалентных lint-упрощений повторно пройдены
+632 server unit + 19 новых protocol + 23 code-action + 8 constructor tests
+(**682 PASS**). Clippy `--all-targets -- -D warnings`, Rustfmt и
+`git diff --check` — PASS. Все Rust-проверки последовательные:
+`CARGO_BUILD_JOBS=1`, тесты с `--test-threads=1`; сборка и тесты на одном CPU,
+MemoryMax 1536M / MemorySwapMax 256M. Server-package debug=0 задан только
+через CLI, assertions сохранены. Повторный Verifier (`gpt-6-astra`) — **GO**;
+проверены логи, документация и hashes 11 Rust-файлов.
+
+README, architecture, LSP feature matrix и test-evidence matrix обновлены;
+historical coverage percentages и production timings не пересчитывались.
+Логи: `server/target/p2-40-2026-10-15/` (ignored).
+
 ### CODEX-P2-41. `includePaths` разрешают выход из workspace
 
 [`normalize_path`](server/crates/php-lsp-server/src/server.rs#L1674) не схлопывает

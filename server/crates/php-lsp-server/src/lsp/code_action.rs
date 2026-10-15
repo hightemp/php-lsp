@@ -7,6 +7,15 @@ use super::document_links::is_static_string_literal_node;
 mod constructor_generation;
 use constructor_generation::{ConstructorGenerationPlan, ParentConstructorPlan};
 
+#[path = "code_action_source.rs"]
+mod structural_source;
+
+#[path = "inherited_method_contracts.rs"]
+mod inherited_method_contracts;
+
+#[path = "code_action_phpdoc.rs"]
+mod action_phpdoc;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImportKind {
     Class,
@@ -514,13 +523,20 @@ fn reference_matches_import(
 
     match import.kind {
         ImportKind::Class => {
-            matches!(
+            (matches!(
                 reference.target_kind,
                 php_lsp_types::PhpSymbolKind::Class
                     | php_lsp_types::PhpSymbolKind::Interface
                     | php_lsp_types::PhpSymbolKind::Trait
                     | php_lsp_types::PhpSymbolKind::Enum
-            ) && fqn_matches_import_or_prefix(target_fqn, import_fqn)
+            ) && fqn_matches_import_or_prefix(target_fqn, import_fqn))
+                || (matches!(
+                    reference.target_kind,
+                    php_lsp_types::PhpSymbolKind::Function
+                        | php_lsp_types::PhpSymbolKind::GlobalConstant
+                ) && target_fqn
+                    .strip_prefix(import_fqn)
+                    .is_some_and(|suffix| suffix.starts_with('\\')))
         }
         ImportKind::Function => {
             reference.target_kind == php_lsp_types::PhpSymbolKind::Function
@@ -651,12 +667,14 @@ fn type_info_uses_import(type_info: &php_lsp_types::TypeInfo, import: &Organizab
             .as_deref()
             .is_some_and(|type_info| type_info_uses_import(type_info, import)),
         php_lsp_types::TypeInfo::Conditional {
+            subject,
             target,
             if_type,
             else_type,
             ..
         } => {
-            type_info_uses_import(target, import)
+            phpdoc_name_uses_import(subject, import)
+                || type_info_uses_import(target, import)
                 || type_info_uses_import(if_type, import)
                 || type_info_uses_import(else_type, import)
         }
@@ -682,6 +700,7 @@ fn type_info_uses_import(type_info: &php_lsp_types::TypeInfo, import: &Organizab
 
 fn phpdoc_name_uses_import(name: &str, import: &OrganizableImport) -> bool {
     let name = name.trim().trim_start_matches('\\');
+    let name = name.split_once("::").map_or(name, |(owner, _)| owner);
     if name.is_empty() {
         return false;
     }
@@ -712,7 +731,17 @@ pub(crate) fn build_organize_imports_edit(
     }
 
     let (start_line, end_line) = find_organizable_use_block(source, file_symbols)?;
+    if !structural_source::organizable_block_is_safe(
+        tree,
+        source,
+        file_symbols,
+        start_line,
+        end_line,
+    ) {
+        return None;
+    }
     let references = collect_symbol_references_in_file(tree, source, file_symbols);
+    let doc_uses = action_phpdoc::source_docs(tree, source);
 
     let mut imports: Vec<OrganizableImport> = file_symbols
         .use_statements
@@ -725,7 +754,10 @@ pub(crate) fn build_organize_imports_edit(
                 .namespace_scope_at_byte_position(use_stmt.range.0, use_stmt.range.1)
                 .cloned(),
         })
-        .filter(|import| import_is_used(import, file_symbols, &references, source))
+        .filter(|import| {
+            import_is_used(import, file_symbols, &references, source)
+                || action_phpdoc::uses_import(&doc_uses, import)
+        })
         .collect();
 
     imports.sort_by(|a, b| {
@@ -928,6 +960,7 @@ pub(crate) fn build_add_return_type_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::AddReturnType {
             hint: hint.clone(),
             insert_position: CodeActionInsertPosition {
@@ -972,6 +1005,8 @@ pub(crate) struct CodeActionData {
     uri: String,
     range: Range,
     document_version: Option<i32>,
+    #[serde(default)]
+    document_generation: Option<u64>,
     extra: CodeActionDataExtra,
 }
 
@@ -1083,6 +1118,7 @@ pub(crate) fn build_implement_missing_methods_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::ImplementMissingMethods {
             class_fqn: class_sym.fqn.clone(),
         },
@@ -1118,6 +1154,7 @@ pub(crate) fn build_generate_constructor_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::GenerateConstructor {
             class_fqn: class_sym.fqn.clone(),
         },
@@ -1153,6 +1190,7 @@ pub(crate) fn build_generate_accessor_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::GenerateAccessor {
             property_fqn: property.fqn.clone(),
             accessor_kind,
@@ -1419,6 +1457,7 @@ pub(crate) fn build_change_visibility_actions(
             uri: uri.as_str().to_string(),
             range: request_range,
             document_version,
+            document_generation: None,
             extra: CodeActionDataExtra::ChangeVisibility {
                 symbol_fqn: symbol.fqn.clone(),
                 target_visibility,
@@ -1472,19 +1511,7 @@ pub(crate) fn direct_member_symbols_from_index(
     index: &WorkspaceIndex,
     type_fqn: &str,
 ) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
-    let mut members = Vec::new();
-    for entry in index.read().file_symbols().iter() {
-        for sym in &entry.value().symbols {
-            if sym
-                .parent_fqn
-                .as_deref()
-                .is_some_and(|parent| parent.eq_ignore_ascii_case(type_fqn))
-            {
-                members.push(Arc::new(sym.clone()));
-            }
-        }
-    }
-    members
+    index.get_direct_members(type_fqn)
 }
 
 pub(crate) fn normalized_method_name(name: &str) -> String {
@@ -1766,6 +1793,7 @@ pub(crate) fn render_method_param(
 pub(crate) struct MethodContractMetadata {
     doc_comment: Option<String>,
     attributes: Vec<String>,
+    declaration: Option<String>,
 }
 
 pub(crate) fn method_attribute_bracket_delta(line: &str) -> isize {
@@ -1809,61 +1837,6 @@ pub(crate) fn collect_attribute_groups(text: &str) -> Vec<String> {
     }
 
     groups
-}
-
-pub(crate) fn preceding_attribute_source(source: &str, method_start: usize) -> &str {
-    let search_start = source[..method_start]
-        .rfind("\n#[")
-        .map(|idx| idx + 1)
-        .or_else(|| source[..method_start].rfind("\n    #[").map(|idx| idx + 1))
-        .unwrap_or(method_start);
-    source.get(search_start..method_start).unwrap_or("")
-}
-
-pub(crate) fn method_contract_metadata(
-    method: &php_lsp_types::SymbolInfo,
-    declaration_source: Option<&str>,
-) -> MethodContractMetadata {
-    let Some(source) = declaration_source else {
-        return MethodContractMetadata {
-            doc_comment: method.doc_comment.clone(),
-            attributes: Vec::new(),
-        };
-    };
-    let Some(method_start) = byte_offset_for_line_col(source, method.range.0, method.range.1)
-    else {
-        return MethodContractMetadata {
-            doc_comment: method.doc_comment.clone(),
-            attributes: Vec::new(),
-        };
-    };
-    let Some(method_end) = byte_offset_for_line_col(source, method.range.2, method.range.3) else {
-        return MethodContractMetadata {
-            doc_comment: method.doc_comment.clone(),
-            attributes: Vec::new(),
-        };
-    };
-
-    let mut attribute_source = String::new();
-    if let Some((_, doc_end)) = symbol_doc_comment_span(source, method) {
-        attribute_source.push_str(source.get(doc_end..method_start).unwrap_or(""));
-    } else {
-        attribute_source.push_str(preceding_attribute_source(source, method_start));
-    }
-    if let Some(method_text) = source.get(method_start..method_end) {
-        if let Some(function_offset) = method_text.find("function") {
-            attribute_source.push_str(method_text.get(..function_offset).unwrap_or(""));
-        }
-    }
-
-    let mut attributes = collect_attribute_groups(&attribute_source);
-    attributes.sort();
-    attributes.dedup();
-
-    MethodContractMetadata {
-        doc_comment: method.doc_comment.clone(),
-        attributes,
-    }
 }
 
 pub(crate) fn render_reindented_block(block: &str, indent: &str) -> String {
@@ -1918,27 +1891,33 @@ pub(crate) fn render_missing_method_stub(
             text.push_str(&render_reindented_block(attribute, method_indent));
         }
     }
-    text.push_str(method_indent);
-    text.push_str(visibility);
-    text.push(' ');
-    if method.modifiers.is_static {
-        text.push_str("static ");
+    if let Some(declaration) = metadata.and_then(|metadata| metadata.declaration.as_deref()) {
+        text.push_str(method_indent);
+        text.push_str(declaration);
+        text.push('\n');
+    } else {
+        text.push_str(method_indent);
+        text.push_str(visibility);
+        text.push(' ');
+        if method.modifiers.is_static {
+            text.push_str("static ");
+        }
+        text.push_str("function ");
+        text.push_str(&method.name);
+        text.push('(');
+        text.push_str(&params);
+        text.push(')');
+        if let Some(return_type) = signature
+            .declared_native_return_type()
+            .and_then(|return_type| {
+                native_type_hint_text(return_type, php_version, TypeHintPosition::Return)
+            })
+        {
+            text.push_str(": ");
+            text.push_str(&return_type);
+        }
+        text.push('\n');
     }
-    text.push_str("function ");
-    text.push_str(&method.name);
-    text.push('(');
-    text.push_str(&params);
-    text.push(')');
-    if let Some(return_type) = signature
-        .declared_native_return_type()
-        .and_then(|return_type| {
-            native_type_hint_text(return_type, php_version, TypeHintPosition::Return)
-        })
-    {
-        text.push_str(": ");
-        text.push_str(&return_type);
-    }
-    text.push('\n');
     text.push_str(method_indent);
     text.push_str("{\n");
     text.push_str(body_indent);
@@ -2112,15 +2091,17 @@ pub(crate) fn implement_missing_methods_edit(
     let rendered_methods = missing_methods
         .iter()
         .map(|method| {
-            render_missing_method_stub(
+            let metadata = metadata_by_fqn.get(&method.fqn)?;
+            metadata.declaration.as_ref()?;
+            Some(render_missing_method_stub(
                 method,
-                metadata_by_fqn.get(&method.fqn),
+                Some(metadata),
                 &insertion.method_indent,
                 &insertion.body_indent,
                 php_version,
-            )
+            ))
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
 
     Some(generated_methods_workspace_edit(
         uri,
@@ -2851,28 +2832,7 @@ pub(crate) fn find_visibility_token(
     source: &str,
     symbol: &php_lsp_types::SymbolInfo,
 ) -> Option<(usize, usize)> {
-    let start = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
-    let end = byte_offset_for_line_col(source, symbol.range.2, symbol.range.3)?;
-    let text = source.get(start..end)?;
-    for keyword in ["public", "protected", "private"] {
-        let mut search_offset = 0usize;
-        while let Some(relative) = text.get(search_offset..)?.find(keyword) {
-            let token_start = search_offset + relative;
-            let token_end = token_start + keyword.len();
-            let before = token_start
-                .checked_sub(1)
-                .and_then(|idx| text.as_bytes().get(idx))
-                .copied();
-            let after = text.as_bytes().get(token_end).copied();
-            if before.is_none_or(|byte| !is_ident_byte(byte))
-                && after.is_none_or(|byte| !is_ident_byte(byte))
-            {
-                return Some((start + token_start, start + token_end));
-            }
-            search_offset = token_end;
-        }
-    }
-    None
+    structural_source::visibility_plan(source, symbol)?.modifier
 }
 
 pub(crate) fn change_visibility_edit(
@@ -2887,21 +2847,21 @@ pub(crate) fn change_visibility_edit(
         return Some(empty_workspace_edit());
     }
 
-    let (start, end, new_text) =
-        if let Some((token_start, token_end)) = find_visibility_token(source, symbol) {
-            (
-                token_start,
-                token_end,
-                visibility_text(target_visibility).to_string(),
-            )
-        } else {
-            let insert_at = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
-            (
-                insert_at,
-                insert_at,
-                format!("{} ", visibility_text(target_visibility)),
-            )
-        };
+    let plan = structural_source::visibility_plan(source, symbol)?;
+    let (start, end, new_text) = if let Some((token_start, token_end)) = plan.modifier {
+        (
+            token_start,
+            token_end,
+            visibility_text(target_visibility).to_string(),
+        )
+    } else {
+        let insert_at = plan.insert_at;
+        (
+            insert_at,
+            insert_at,
+            format!("{} ", visibility_text(target_visibility)),
+        )
+    };
 
     let mut changes = HashMap::new();
     changes.insert(
@@ -3385,6 +3345,7 @@ pub(crate) fn build_promote_constructor_parameter_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::PromoteConstructorParameter {
             property_fqn: property.fqn.clone(),
         },
@@ -4141,6 +4102,7 @@ pub(crate) fn build_extract_variable_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::ExtractVariable {
             variable_name: plan.variable_name.clone(),
         },
@@ -4412,6 +4374,7 @@ pub(crate) fn build_extract_constant_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::ExtractConstant {
             constant_name: plan.constant_name.clone(),
         },
@@ -5052,6 +5015,7 @@ pub(crate) fn build_inline_variable_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::InlineVariable {
             variable_name: plan.variable_name.clone(),
         },
@@ -5860,6 +5824,7 @@ pub(crate) fn build_update_phpdoc_from_signature_action(
         uri: uri.as_str().to_string(),
         range: request_range,
         document_version,
+        document_generation: None,
         extra: CodeActionDataExtra::UpdatePhpDoc {
             symbol_fqn: symbol.fqn.clone(),
         },
@@ -6080,33 +6045,58 @@ pub(crate) fn diagnostic_range_byte_offsets(source: &str, range: Range) -> Optio
     Some((start.min(source.len()), end.min(source.len())))
 }
 
+#[cfg(test)]
 pub(crate) fn remove_unused_import_edit(
     uri: Uri,
     source: &str,
     range: Range,
 ) -> Option<WorkspaceEdit> {
-    let (start, end) = diagnostic_range_byte_offsets(source, range)?;
-    let (start, end) = line_full_span(source, start, end);
-    Some(workspace_edit_from_text_edits(
-        uri,
-        vec![TextEdit {
-            range: lsp_range_for_byte_offsets(source, start, end),
-            new_text: String::new(),
-        }],
-    ))
+    structural_source::remove_import(uri, source, range)
 }
 
 pub(crate) fn build_remove_unused_import_action(
     uri: Uri,
     source: &str,
+    tree: &tree_sitter::Tree,
+    file: &php_lsp_types::FileSymbols,
+    usage: (
+        &[php_lsp_types::SymbolReference],
+        &[action_phpdoc::ScopedDoc],
+    ),
     diagnostic: &Diagnostic,
     is_preferred: bool,
 ) -> Option<CodeActionOrCommand> {
+    let import = file
+        .use_statements
+        .iter()
+        .find(|import| range_from_byte_range(source, import.range) == diagnostic.range)?;
+    if diagnostic.message.strip_prefix("Unused import: ") != Some(import.fqn.as_str()) {
+        return None;
+    }
+    let candidate = OrganizableImport {
+        fqn: import.fqn.trim_start_matches('\\').into(),
+        alias: import.alias.clone(),
+        kind: import_kind_from_use_kind(import.kind),
+        scope: file
+            .namespace_scope_at_byte_position(import.range.0, import.range.1)
+            .cloned(),
+    };
+    if tree.root_node().has_error()
+        || import_is_used(&candidate, file, usage.0, source)
+        || action_phpdoc::uses_import(usage.1, &candidate)
+    {
+        return None;
+    }
     Some(CodeActionOrCommand::CodeAction(CodeAction {
         title: "Remove unused import".to_string(),
         kind: Some(CodeActionKind::QUICKFIX),
         diagnostics: Some(vec![diagnostic.clone()]),
-        edit: Some(remove_unused_import_edit(uri, source, diagnostic.range)?),
+        edit: Some(structural_source::remove_import_from_tree(
+            uri,
+            source,
+            diagnostic.range,
+            tree,
+        )?),
         command: None,
         is_preferred: Some(is_preferred),
         disabled: None,
@@ -6180,13 +6170,6 @@ pub(crate) fn build_diagnostic_replacement_action(
     }))
 }
 
-pub(crate) fn line_insert_position(line: u32) -> Range {
-    Range {
-        start: Position::new(line, 0),
-        end: Position::new(line, 0),
-    }
-}
-
 pub(crate) fn analyzer_ignore_comment(
     source: &str,
     diagnostic: &Diagnostic,
@@ -6198,7 +6181,11 @@ pub(crate) fn analyzer_ignore_comment(
         ExternalAnalyzer::PhpStan => Some(format!("{indent}// @phpstan-ignore-next-line\n")),
         ExternalAnalyzer::Psalm => {
             let code = diagnostic_code_str(diagnostic)?.trim();
-            if code.is_empty() {
+            if code.is_empty()
+                || !code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
                 return None;
             }
             Some(format!("{indent}/** @psalm-suppress {code} */\n"))
@@ -6212,17 +6199,12 @@ pub(crate) fn build_ignore_external_analyzer_action(
     diagnostic: &Diagnostic,
     analyzer: ExternalAnalyzer,
 ) -> Option<CodeActionOrCommand> {
+    let edit = structural_source::analyzer_ignore_edit(uri, source, diagnostic, analyzer)?;
     Some(CodeActionOrCommand::CodeAction(CodeAction {
         title: format!("Ignore {} diagnostic locally", analyzer.display_name()),
         kind: Some(CodeActionKind::QUICKFIX),
         diagnostics: Some(vec![diagnostic.clone()]),
-        edit: Some(workspace_edit_from_text_edits(
-            uri,
-            vec![TextEdit {
-                range: line_insert_position(diagnostic.range.start.line),
-                new_text: analyzer_ignore_comment(source, diagnostic, analyzer)?,
-            }],
-        )),
+        edit: Some(edit),
         command: None,
         is_preferred: Some(false),
         disabled: None,
@@ -6557,6 +6539,65 @@ fn open_document_snapshot_for_code_action(
     (snapshot.document_state.map(|state| state.version) == expected_version).then_some(snapshot)
 }
 
+fn stamp_code_actions(
+    backend: &PhpLspBackend,
+    uri: &str,
+    expected: Option<OpenDocumentState>,
+    mut actions: Vec<CodeActionOrCommand>,
+) -> Vec<CodeActionOrCommand> {
+    if backend.current_document_state(uri) != expected {
+        return Vec::new();
+    }
+    for action in &mut actions {
+        if let CodeActionOrCommand::CodeAction(action) = action {
+            version_action_edit(backend, uri, expected.map(|state| state.version), action);
+            if let Some(data) = action.data.as_mut().and_then(|data| data.as_object_mut()) {
+                data.insert(
+                    "documentGeneration".into(),
+                    serde_json::json!(expected.map(|state| state.generation)),
+                );
+            }
+        }
+    }
+    actions
+}
+
+fn version_action_edit(
+    backend: &PhpLspBackend,
+    uri: &str,
+    version: Option<i32>,
+    action: &mut CodeAction,
+) {
+    if !backend.document_changes_supported.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(version) = version else {
+        return;
+    };
+    let Some(edit) = action.edit.as_mut() else {
+        return;
+    };
+    let Some(changes) = edit.changes.as_ref() else {
+        return;
+    };
+    if changes.is_empty() || changes.keys().any(|key| key.as_str() != uri) {
+        return;
+    }
+    let changes = edit.changes.take().unwrap();
+    edit.document_changes = Some(DocumentChanges::Edits(
+        changes
+            .into_iter()
+            .map(|(uri, edits)| TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: Some(version),
+                },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            })
+            .collect(),
+    ));
+}
+
 impl PhpLspBackend {
     pub(crate) async fn lsp_code_action(
         &self,
@@ -6637,6 +6678,34 @@ impl PhpLspBackend {
                             })
                             .flatten()
                     })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let implementation_action = if wants_implement_missing_methods {
+            let range = lsp_range_to_byte_range(&source, params.range);
+            if let Some(class_sym) = concrete_class_symbol_at_range(&file_symbols, range) {
+                let methods =
+                    missing_implementation_methods(&request_index, &file_symbols, class_sym);
+                if !methods.is_empty()
+                    && self
+                        .implementation_contracts(&request, &file_symbols, class_sym, &methods)
+                        .await
+                        .is_some()
+                {
+                    build_implement_missing_methods_action(
+                        uri.clone(),
+                        class_sym,
+                        &methods,
+                        params.range,
+                        document_version,
+                    )
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -6784,28 +6853,8 @@ impl PhpLspBackend {
             } else {
                 Vec::new()
             };
-            let implement_missing_methods_actions = if wants_implement_missing_methods {
-                let range = lsp_range_to_byte_range(&source, params.range);
-                concrete_class_symbol_at_range(&file_symbols, range)
-                    .and_then(|class_sym| {
-                        let missing_methods = missing_implementation_methods(
-                            &request_index,
-                            &file_symbols,
-                            class_sym,
-                        );
-                        build_implement_missing_methods_action(
-                            uri.clone(),
-                            class_sym,
-                            &missing_methods,
-                            params.range,
-                            document_version,
-                        )
-                    })
-                    .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let implement_missing_methods_actions =
+                implementation_action.into_iter().collect::<Vec<_>>();
             (
                 source,
                 file_symbols,
@@ -6841,7 +6890,12 @@ impl PhpLspBackend {
         }
 
         if !wants_quickfix {
-            return Ok(Some(actions));
+            return Ok(Some(stamp_code_actions(
+                self,
+                &uri_str,
+                document_state,
+                actions,
+            )));
         }
 
         let diagnostics = if params.context.diagnostics.is_empty() {
@@ -6868,6 +6922,16 @@ impl PhpLspBackend {
 
         let all_quickfix_diagnostics = diagnostics.clone();
         let mut quickfix_count = 0usize;
+        let unused_import_references = if diagnostics.iter().any(is_unused_import_diagnostic) {
+            collect_symbol_references_in_file(&tree, &source, &file_symbols)
+        } else {
+            Vec::new()
+        };
+        let unused_import_docs = if diagnostics.iter().any(is_unused_import_diagnostic) {
+            action_phpdoc::source_docs(&tree, &source)
+        } else {
+            Vec::new()
+        };
 
         for diagnostic in diagnostics {
             let data = diagnostic_data(&diagnostic);
@@ -6893,6 +6957,9 @@ impl PhpLspBackend {
                 if let Some(action) = build_remove_unused_import_action(
                     uri.clone(),
                     &source,
+                    &tree,
+                    &file_symbols,
+                    (&unused_import_references, &unused_import_docs),
                     &diagnostic,
                     quickfix_count == 0,
                 ) {
@@ -7004,7 +7071,12 @@ impl PhpLspBackend {
             actions.push(action);
         }
 
-        Ok(Some(actions))
+        Ok(Some(stamp_code_actions(
+            self,
+            &uri_str,
+            document_state,
+            actions,
+        )))
     }
 
     pub(crate) async fn lsp_code_action_resolve(
@@ -7023,10 +7095,20 @@ impl PhpLspBackend {
             uri,
             range: requested_range,
             document_version,
+            document_generation,
             extra,
         } = data;
+        if self
+            .current_document_state(&uri)
+            .map(|state| (state.version, state.generation))
+            != document_version.zip(document_generation)
+        {
+            params.edit = Some(empty_workspace_edit());
+            return Ok(params);
+        }
         let request = self.request_context_for_uri(&uri).await;
         let request_index = request.index(&self.index);
+        let mut implementation_plan = None;
 
         match (action_kind, extra) {
             (
@@ -7092,31 +7174,34 @@ impl PhpLspBackend {
                 };
 
                 let php_version = request.runtime_config().php_version;
+                let expected_state = self.current_document_state(&uri);
+                let revision = request_index.revision_snapshot();
                 let missing_methods =
                     missing_implementation_methods(&request_index, &file_symbols, class_sym);
-                let mut metadata_by_fqn = HashMap::new();
-                for method in &missing_methods {
-                    let declaration_source = self
-                        .source_for_uri_in_request(
-                            &request,
-                            &method.uri,
-                            "implement missing methods source read",
-                        )
-                        .await;
-                    metadata_by_fqn.insert(
-                        method.fqn.clone(),
-                        method_contract_metadata(method, declaration_source.as_deref()),
-                    );
+                let Some(plan) = self
+                    .implementation_contracts(&request, &file_symbols, class_sym, &missing_methods)
+                    .await
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                if self.runtime_state_snapshot().await.generation != request.state.generation
+                    || self.current_document_state(&uri) != expected_state
+                    || request_index.revision_snapshot() != revision
+                {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 }
                 params.edit = implement_missing_methods_edit(
                     uri_value,
                     &source,
                     class_sym,
                     &missing_methods,
-                    &metadata_by_fqn,
+                    &plan.metadata,
                     php_version,
                 )
                 .or_else(|| Some(empty_workspace_edit()));
+                implementation_plan = Some(plan);
             }
             (
                 CodeActionDataKind::GenerateConstructor,
@@ -7448,6 +7533,27 @@ impl PhpLspBackend {
             }
         }
 
+        if self
+            .current_document_state(&uri)
+            .map(|state| (state.version, state.generation))
+            != document_version.zip(document_generation)
+        {
+            params.edit = Some(empty_workspace_edit());
+        }
+        #[cfg(test)]
+        inherited_method_contracts::pause_publication(&uri).await;
+        if self.runtime_state_snapshot().await.generation != request.state.generation
+            || implementation_plan
+                .as_ref()
+                .is_some_and(|plan| !plan.is_current(self, &request_index))
+            || self
+                .current_document_state(&uri)
+                .map(|state| (state.version, state.generation))
+                != document_version.zip(document_generation)
+        {
+            params.edit = Some(empty_workspace_edit());
+        }
+        version_action_edit(self, &uri, document_version, &mut params);
         Ok(params)
     }
 }
@@ -7455,3 +7561,7 @@ impl PhpLspBackend {
 #[cfg(test)]
 #[path = "code_action_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "code_action_source_tests.rs"]
+mod source_tests;

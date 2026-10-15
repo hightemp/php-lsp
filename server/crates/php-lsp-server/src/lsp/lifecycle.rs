@@ -24,6 +24,16 @@ impl PhpLspBackend {
         params: InitializeParams,
     ) -> Result<InitializeResult> {
         tracing::info!("php-lsp: initialize");
+        self.document_changes_supported.store(
+            params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.workspace_edit.as_ref())
+                .and_then(|edit| edit.document_changes)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
 
         // Store trace level from client
         if let Some(trace) = params.trace {

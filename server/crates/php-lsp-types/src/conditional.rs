@@ -697,6 +697,39 @@ fn union(types: Vec<TypeInfo>) -> TypeInfo {
     }
 }
 
+/// Transform children before their parent with substitution's depth/work limits.
+/// Replacements are not traversed again. Failure discards the whole result.
+pub fn try_transform_type(
+    ty: &TypeInfo,
+    transform: &mut impl FnMut(TypeInfo) -> Option<TypeInfo>,
+) -> Option<TypeInfo> {
+    fn visit(
+        ty: &TypeInfo,
+        transform: &mut impl FnMut(TypeInfo) -> Option<TypeInfo>,
+        depth: usize,
+        remaining: &mut usize,
+    ) -> Option<TypeInfo> {
+        if depth >= MAX_DEPTH || *remaining == 0 || child_count(ty) > *remaining {
+            return None;
+        }
+        *remaining -= 1;
+        let mut failed = false;
+        let mapped = map_children(ty, &mut |child| {
+            visit(child, transform, depth + 1, remaining).unwrap_or_else(|| {
+                failed = true;
+                TypeInfo::Mixed
+            })
+        });
+        if failed {
+            None
+        } else {
+            transform(mapped)
+        }
+    }
+    let mut remaining = MAX_MATCH_STEPS;
+    visit(ty, transform, 0, &mut remaining)
+}
+
 fn map_children(ty: &TypeInfo, map: &mut impl FnMut(&TypeInfo) -> TypeInfo) -> TypeInfo {
     use TypeInfo::*;
     match ty {
@@ -748,3 +781,7 @@ fn map_children(ty: &TypeInfo, map: &mut impl FnMut(&TypeInfo) -> TypeInfo) -> T
 #[cfg(test)]
 #[path = "conditional_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "type_transform_tests.rs"]
+mod transform_tests;

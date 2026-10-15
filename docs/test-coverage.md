@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35/P2-36/P2-37/P2-38/P2-39 (2026-10-14).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), P2-35/P2-36/P2-37/P2-38/P2-39 (2026-10-14), and P2-40 (2026-10-15).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -66,8 +66,8 @@ percentages have not been remeasured.
 | Constant reference identity | expression roles, declarations, attributes/members/labels, dynamic names, qualified rename, imports, document edits/reopen and cache replay | T | B | B | [parser matrices](../server/crates/php-lsp-parser/src/constant_reference_tests.rs), [kind/owner checks](../server/crates/php-lsp-server/src/lsp/constant_reference_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_constant_references.rs), [cache replay](../server/crates/php-lsp-index/src/cache_tests.rs). |
 | Workspace symbols | indexed search, ranking, URI/range | T | B | B | [workspace symbol tests](../server/crates/php-lsp-server/src/server_tests.rs), [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Rename | locals, imports, members, unsafe targets | T | B | B | [references protocol tests](../server/crates/php-lsp-server/tests/e2e_references.rs), [rename unit tests](../server/crates/php-lsp-server/src/lsp/rename_tests.rs). |
-| Code actions | imports, organize imports, analyzer fixes | T | B | B | [code-action protocol tests](../server/crates/php-lsp-server/tests/e2e_code_actions.rs). |
-| Code actions | generate/implement members, parent constructor | T | B | B | [code-action tests](../server/crates/php-lsp-server/tests/e2e_code_actions.rs), [constructor tests](../server/crates/php-lsp-server/tests/e2e_constructor.rs). |
+| Code actions | modifier decoys, inline/group imports, usedness, analyzer placement, UTF-16/CRLF | T | B | B | [applied-edit unit tests](../server/crates/php-lsp-server/src/lsp/code_action_source_tests.rs), [code-action protocol tests](../server/crates/php-lsp-server/tests/e2e_code_actions.rs). Tests preserve neighboring statements, comments, literals and PHPDoc; external PHPStan/Psalm processes are not exercised for marker placement. |
+| Code actions | inherited namespace/type/default/attribute identity, trait consumers, conflicting contracts, PHP gates, reopen/source changes and cancellation | T | B | B | [contract protocol tests](../server/crates/php-lsp-server/tests/e2e_code_action_contracts.rs), [controlled lifecycle tests](../server/crates/php-lsp-server/src/lsp/inherited_method_contracts_tests.rs), [bounded type-transform tests](../server/crates/php-lsp-types/src/type_transform_tests.rs), [constructor tests](../server/crates/php-lsp-server/tests/e2e_constructor.rs). Barriers cover worker and final-publication invalidation plus permit ownership after cancellation; this is finite event-order coverage, not every scheduler interleaving. |
 | Code actions | extract/inline, stale resolve, PHP version | T | B | B | [code-action protocol tests](../server/crates/php-lsp-server/tests/e2e_code_actions.rs). |
 | Formatting | configured command, auto-detection, range/on-type | T | B | B | [formatting protocol tests](../server/crates/php-lsp-server/tests/e2e_formatting.rs); platform shell/process differences are untested. |
 | Symbols/folding/links/tokens | namespace/global sections, full, range, delta, UTF-16 | T | B | B | [document-symbol tests](../server/crates/php-lsp-server/tests/e2e_document_symbols.rs), [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs), [range tests](../server/crates/php-lsp-server/tests/e2e_ranges.rs). |
@@ -125,7 +125,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36/P2-37/P2-38/P2-39 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36/P2-37/P2-38/P2-39/P2-40 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |

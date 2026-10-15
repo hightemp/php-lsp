@@ -556,10 +556,38 @@ request cannot combine a new symbol index with an older editor buffer.
 | References/code lens | `src/lsp/references.rs`, `src/lsp/code_lens.rs` | `references.rs`, `reference_roles.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs`, `tests/e2e_reference_roles.rs`, `tests/e2e_code_lens.rs`, `src/lsp/reference_ui_tests.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
 | Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |
-| Code actions/refactors | `src/lsp/code_action.rs` | parser helpers, return type helpers | symbol/member lookup | server unit tests + `tests/e2e_code_actions.rs` |
+| Code actions/refactors | `src/lsp/code_action.rs`, `code_action_source.rs`, `code_action_phpdoc.rs`, `inherited_method_contracts.rs` | CST edit spans, PHPDoc facts and bounded type transformation | source-backed member contracts and index revision checks | source/contract unit tests + `tests/e2e_code_actions.rs`, `tests/e2e_code_action_contracts.rs` |
 | Inlay hints | `src/lsp/inlay_hints.rs` plus shared inference helpers in `server.rs` | type inference and local variable scans | indexed signatures/types | `tests/e2e_hover.rs` |
 | Templates | `template.rs` plus template-aware LSP handlers | virtual PHP/source maps | Twig context scans | `tests/e2e_templates.rs` |
 | Stubs/vendor/cache | `src/indexing/*` runtime orchestration and lazy index paths | symbol extraction | `php-lsp-index::{stubs,composer,cache}` storage/loading primitives | index unit tests + `tests/e2e_indexing.rs` |
+
+## Code-action source contracts
+
+`lsp/code_action_source.rs` derives visibility, individual import removal and
+analyzer-ignore edits from CST nodes. Import removal revalidates semantic use,
+including namespace prefixes in function/constant calls and local or prefixed
+PHPDoc types. The bulk organizer must prove that its replacement span contains
+only supported import declarations and whitespace. `code_action_phpdoc.rs`
+shares scoped PHPDoc facts and contract identities; prose and string contents
+do not establish import use.
+
+`inherited_method_contracts.rs` validates every ancestor and trait consumer
+against source provenance, then relocates native headers, constant defaults,
+attributes and supported PHPDoc tags into the target namespace. Imports are
+scoped to the declaration and its namespace section. Raw literal contents,
+reference returns and composite type grouping are preserved. Multiple required
+contracts for one method must agree; unsupported or unresolved contracts fail
+closed. There is no fallback to copying an unverified source-relative header.
+
+Hierarchy traversal and donor parsing use cancellable blocking I/O work under
+one total 15-second budget. Donors are processed one file/tree at a time;
+cancellation retains the worker permit until the blocking task exits. Closed
+sources require an indexed content fingerprint and a final content recheck.
+Publication rechecks runtime generation, index revision, target lifetime and
+all donor document states after the final await. This is snapshot validation,
+not an atomic transaction with external filesystem writers. Versioned edits
+protect application to the target buffer when the client advertises support;
+clients without that capability retain the legacy edit format.
 
 ## Completion Context
 

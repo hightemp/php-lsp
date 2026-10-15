@@ -107,18 +107,38 @@ organize imports follow these same roles.
 | `textDocument/rename` | Partial | Supports classes, functions, methods, properties, constants, enum cases, and same-scope local variables. For `use` clauses, import-target edits select the terminal segment and preserve explicit alias spelling; member edits require an exact or type-resolved receiver. New names and casing are handled by symbol kind. Built-ins and PHPDoc virtual members are not renamed. Workspace rename can still be expensive on large workspaces. |
 | `textDocument/prepareRename` | Supported | Rejects unsupported, built-in, virtual, or unsafe unresolved member targets before rename. |
 | `textDocument/codeAction` quick fix | Supported | Adds imports for unresolved classes/functions when candidates exist, removes one unused import, bulk-removes unused imports through organize imports, applies diagnostic replacement metadata, and supports opt-in PHPStan/Psalm local fixes for ignore comments, missing `@throws`, iterable PHPDoc value types, and prefixed class-name replacements. |
-| `textDocument/codeAction` implement missing methods | Supported | Generates concrete stubs for missing interface, abstract parent, and abstract trait methods. Preserves method PHPDoc, analyzer-specific contract tags, safe method attributes, visibility, static, params, defaults, and native-safe return types. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
+| `textDocument/codeAction` implement missing methods | Partial | Generates concrete stubs from verified interface, abstract parent and abstract trait source. Preserves supported native/PHPDoc contracts, reference returns, method/parameter attributes and constant defaults while qualifying names in their original scope. Conflicting or unprovable contracts are omitted; stale target/dependency snapshots resolve to a no-op edit. |
 | `textDocument/codeAction` generate members | Supported | Generates constructors and property getters/setters from indexed property symbols. Handles readonly/static properties, bool getter naming, nullable/default values, refined property PHPDoc types, analyzer-specific `@phpstan-var`/`@psalm-var` tags, and native-safe signatures. |
 | `textDocument/codeAction` visibility and promotion refactors | Supported | Changes visibility for methods, properties, constants, and promoted properties with interface, abstract, and override contract guards. Promotes simple constructor assignment patterns to constructor property promotion, moving safe property PHPDoc and attributes onto the promoted parameter and refusing complex assignment patterns. |
 | `textDocument/codeAction` PHPDoc signature sync | Supported | Updates `@param` order/types/tokens and native-return-driven `@return` tags from function/method signatures. Preserves descriptions, analyzer-specific richer generic PHPDoc types, summaries, and unrelated tags such as templates, throws, deprecation, virtual properties, and virtual methods. |
 | `textDocument/codeAction` extract and inline refactors | Supported | Extracts exact selected expressions to collision-free local variables, extracts class-scope scalar literals to collision-free `private const` members, and inlines local variables with one simple assignment and one or more same-block reads. Refuses non-literals, out-of-class constants, branch/closure crossing, reassignment, compound assignment, and self-referential RHS cases. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
 | `source.organizeImports` | Supported | Sorts import statements with the existing class/function/constant grouping and removes unused imports from semantic references instead of raw text matches. Class imports used only in parsed PHPDoc type positions are kept; mentions in comments, strings, summaries, or PHPDoc prose do not count as usage. |
-| `codeAction/resolve` | Supported | Used for heavier refactor actions so `textDocument/codeAction` can return lightweight actions first. |
+| `codeAction/resolve` | Supported | Computes refactor edits after rechecking document version and lifetime. Inherited-method proposals also validate their source contracts. Single-document edits carry an expected version when the client advertises `workspaceEdit.documentChanges`; legacy clients receive `changes`. |
 | `refactor.rewrite` add return type | Partial | Adds return types from PHPDoc where supported by the configured PHP version. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
 | Native PHP formatter | Unsupported | Formatting is delegated to external commands. There is no `built-in` provider; see ADR-017 in `DECISIONS.md`. |
 | `textDocument/formatting` | Partial | Uses trusted `phpLsp.formatting.provider`, `phpLsp.formatting.command`, or auto-detected Composer tools (`pint`, `php-cs-fixer`, `phpcbf`). Project `.php-lsp.toml` commands require `phpLsp.allowProjectCommands`. External formatter processes are timeout-bound and cancellable. |
 | `textDocument/rangeFormatting` | Partial | Uses the same external formatter resolution, but formats only selected PHP fragments via temporary files and never formats the whole document for a range request. |
 | `textDocument/onTypeFormatting` | Supported | Local indentation edits for newline, semicolon, and closing brace. |
+
+Visibility edits select declaration modifier tokens, excluding body text,
+comments and attributes. Removing one unused import edits its CST clause and
+separator, preserving neighboring imports and inline statements. Current
+references and PHPDoc uses are rechecked before removal; bulk organization is
+omitted for blocks containing inline code or comments it cannot preserve.
+
+Analyzer ignores require a supported CST statement/declaration. Psalm inserts
+before that owner or merges into its attached PHPDoc. PHPStan's line-based
+marker is offered only when the diagnostic starts on the owner's first line
+and no attached PHPDoc would be displaced. Unsupported placements produce no
+action; multiline string contents are never edited to insert a marker.
+
+Inherited contracts preserve native DNF grouping, relative `self`/`parent`
+ownership (including trait consumers), method template bounds and multiline
+PHPDoc types. Generation refuses unresolved/cyclic ancestors, conflicting
+same-name contracts, trait adaptations, unbound class templates/type aliases,
+unsupported annotations, nonportable defaults and syntax unavailable in the
+configured PHP version. This is conservative source relocation, not full
+generic substitution or PHPStan/Psalm contract checking.
 
 Constructor generation forwards the effective parent constructor's native
 parameters, including references and variadics, and inserts an explicit
