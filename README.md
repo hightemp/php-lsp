@@ -143,6 +143,9 @@ phpstorm-stubs support.
 - Quick fixes to import unresolved classes/functions, remove unused imports,
   apply diagnostic replacement metadata, and optionally map PHPStan/Psalm
   findings to local fixes.
+- Opt-in analyzer fixes add supported `@throws` tags, explicitly document
+  unknown iterable values as `mixed`, and correct proven class/function names.
+  They use diagnostics published by the analyzer pipeline and reject stale edits.
 - Source action to organize imports.
 - Quick fix to implement missing interface, abstract parent, and abstract trait
   methods while preserving PHPDoc, analyzer tags, attributes, visibility,

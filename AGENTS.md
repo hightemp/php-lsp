@@ -27,6 +27,7 @@
 ## Нужно учесть
 
 - Что в vendor папке PHP проекта могут быть симлинки на разрабатываемые библиотеки. Так что не стоит пытаться убрать симлинки.
+- Свободной RAM на компе мало, могут быть OOM.
 
 ## Project Structure & Module Organization
 - `server/` contains the Rust workspace for the language server.

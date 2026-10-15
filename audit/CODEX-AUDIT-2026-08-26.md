@@ -2869,6 +2869,47 @@ README, architecture, LSP feature matrix и test-evidence matrix обновле�
 historical coverage percentages и production timings не пересчитывались.
 Логи: `server/target/p2-40-2026-10-15/` (ignored).
 
+**Дополнение: production diagnostic quick-fix metadata (2026-10-15).**
+Follow-up QFM-001..004 подключает producer для ранее существовавших handlers.
+**Статус follow-up: выполнено (2026-10-15).** Обычные JSON-диагностики
+проходят через analyzer publication pipeline и получают metadata для:
+`@throws` (PHPStan/Psalm), явного `mixed` у plain array/iterable parameter
+(PHPStan), исправления подтверждённого class-name FQN/casing и `Replace with …`
+для PHPStan `function.nameCase`. Настройка `phpLsp.analyzerCodeActions.enabled`
+сохраняется и по умолчанию выключена. Точные supported codes и ограничения
+приведены в [configuration](../docs/configuration.md#analyzer-quick-fixes).
+Произвольный deprecated prose не интерпретируется как replacement recipe.
+
+Metadata содержит URI, fingerprint source, version/lifetime, runtime generation
+и точные owner/edit ranges; при запросе action она заново выводится из текущих
+CST/index facts. Работа выполняется cancellable blocking helper с проверкой
+runtime/index/document state перед ответом. Кандидаты с неверным kind для
+`new`/`extends`/`implements` отклоняются. Общий iterable сохраняет unknown key
+type, nullable defaults не теряют `null`, richer PHPDoc не заменяется на mixed.
+PHPDoc helpers сохраняют inline PHP, CRLF, целые multiline tags, variable
+reference prefixes и descriptions. Один UTF-16 индекс строится на batch;
+используется существующий cancellable reference collector.
+
+**TDD:** 16 новых тестов (6 unit, 10 protocol). Исходный RED воспроизвёл
+отсутствие metadata в реальной публикации; дополнительные RED выявили inline
+HTML вместо PHPDoc, CRLF loss, split/duplicate multiline and by-ref tags,
+сужение iterable key/null contracts, неверные class candidates и 144 построения
+position index вместо одного. Barriers проверяют index/runtime/edit/reopen
+во время validation и остановку отменённого worker с освобождением permit.
+Protocol tests запускают fixture executable с обычным PHPStan/Psalm JSON и
+проверяют publishDiagnostics → codeAction → applied edits; установленные
+PHPStan/Psalm не запускались. Форматы сверены с upstream rules.
+
+**Проверки follow-up:** полный `cargo test --all` — **1970 PASS, 0 FAIL,
+0 ignored** (67 result blocks). Clippy `--all-targets -- -D warnings`,
+Rustfmt и `git diff --check` — PASS. Все проверки последовательные,
+`CARGO_BUILD_JOBS=1`, тесты с `--test-threads=1`; сборки/тесты на одном CPU,
+MemoryMax 1536M / MemorySwapMax 256M, CLI server-package debug=0 с сохранением
+assertions. Hashes пяти Rust-файлов совпадают с прошедшим проверки snapshot.
+Повторный Verifier (`gpt-6-astra`) — **GO**; проверены результаты, hashes и документация.
+
+Логи follow-up: `server/target/analyzer-actions-2026-10-15/` (ignored).
+
 ### CODEX-P2-41. `includePaths` разрешают выход из workspace
 
 [`normalize_path`](server/crates/php-lsp-server/src/server.rs#L1674) не схлопывает

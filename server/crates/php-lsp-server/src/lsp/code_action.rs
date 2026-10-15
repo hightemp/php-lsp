@@ -16,6 +16,9 @@ mod inherited_method_contracts;
 #[path = "code_action_phpdoc.rs"]
 mod action_phpdoc;
 
+#[path = "diagnostic_fixes.rs"]
+pub(in crate::server) mod diagnostic_fixes;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImportKind {
     Class,
@@ -5954,15 +5957,20 @@ pub(crate) struct DiagnosticDataEnvelope {
     php_lsp: Option<PhpLspDiagnosticData>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PhpLspDiagnosticData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<diagnostic_fixes::FixSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_range: Option<(u32, u32, u32, u32)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     replacement: Option<DiagnosticReplacement>,
     #[serde(default)]
     analyzer_fixes: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiagnosticReplacement {
     new_text: String,
@@ -6257,6 +6265,9 @@ pub(crate) fn render_existing_phpdoc_plan(
     if starts_standalone && !ends_standalone {
         new_text.push('\n');
     }
+    if source.contains("\r\n") {
+        new_text = new_text.replace('\n', "\r\n");
+    }
 
     Some(UpdatePhpDocPlan {
         start,
@@ -6271,11 +6282,19 @@ pub(crate) fn render_created_phpdoc_plan(
     content_lines: Vec<String>,
 ) -> Option<UpdatePhpDocPlan> {
     let declaration_start = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
-    let insert_at = line_start_offset(source, declaration_start);
+    let line_start = line_start_offset(source, declaration_start);
+    let insert_at = if source[line_start..declaration_start].trim().is_empty() {
+        line_start
+    } else {
+        declaration_start
+    };
     let indent = line_indent_at_offset(source, declaration_start);
     let mut new_text =
         render_phpdoc_comment(&indent, &normalize_phpdoc_content_lines(content_lines));
     new_text.push('\n');
+    if source.contains("\r\n") {
+        new_text = new_text.replace('\n', "\r\n");
+    }
     Some(UpdatePhpDocPlan {
         start: insert_at,
         end: insert_at,
@@ -6302,7 +6321,7 @@ pub(crate) fn add_throws_phpdoc_edit(
         let insert_at = lines
             .iter()
             .rposition(|line| phpdoc_line_is_tag(line))
-            .map(|idx| idx + 1)
+            .map(|idx| phpdoc_tag_block_end(&lines, idx))
             .unwrap_or_else(|| phpdoc_managed_insert_index(&lines));
         lines.insert(insert_at, throws_line);
         render_existing_phpdoc_plan(source, symbol, lines)?
@@ -6339,9 +6358,19 @@ pub(crate) fn phpdoc_param_insert_index(lines: &[String]) -> usize {
             lines
                 .iter()
                 .rposition(|line| phpdoc_line_starts_with_tag(line, "@param"))
-                .map(|idx| idx + 1)
+                .map(|idx| phpdoc_tag_block_end(lines, idx))
         })
         .unwrap_or_else(|| phpdoc_managed_insert_index(lines))
+}
+
+fn phpdoc_tag_block_end(lines: &[String], start: usize) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| phpdoc_line_is_tag(line))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len())
 }
 
 pub(crate) fn update_param_phpdoc_lines(
@@ -6350,30 +6379,32 @@ pub(crate) fn update_param_phpdoc_lines(
     type_text: &str,
 ) -> Vec<String> {
     let variable_token = format!("${variable}");
-    for line in &mut lines {
-        let Some(rest) = phpdoc_tag_rest(line, "@param") else {
+    for start in 0..lines.len() {
+        if phpdoc_tag_rest(&lines[start], "@param").is_none() {
+            continue;
+        }
+        let end = phpdoc_tag_block_end(&lines, start);
+        let mut block = lines[start..end].join("\n");
+        let Some(rest) = phpdoc_tag_rest(&block, "@param") else {
             continue;
         };
-        let Some(type_end) = consume_phpdoc_type_expr(rest) else {
+        let Some((variable_start, variable_end)) = find_phpdoc_variable_token_span(rest) else {
             continue;
         };
-        let after_type = rest[type_end..].trim_start();
-        let Some((variable_start, variable_end)) = find_phpdoc_variable_token_span(after_type)
-        else {
-            continue;
-        };
-        let existing_variable_text = after_type[variable_start..variable_end].trim();
+        let existing_variable_text = rest[variable_start..variable_end].trim();
         if phpdoc_variable_name_from_token(existing_variable_text).as_deref() != Some(variable) {
             continue;
         }
 
-        let description = after_type[variable_end..].trim();
-        let mut updated = format!("@param {} {}", type_text.trim(), existing_variable_text);
-        if !description.is_empty() {
-            updated.push(' ');
-            updated.push_str(description);
-        }
-        *line = updated;
+        let type_start = block.len() - rest.len();
+        let type_end = rest[..variable_start].trim_end().len();
+        let replacement = if type_end == 0 {
+            format!("{} ", type_text.trim())
+        } else {
+            type_text.trim().into()
+        };
+        block.replace_range(type_start..type_start + type_end, &replacement);
+        lines.splice(start..end, block.split('\n').map(str::to_string));
         return lines;
     }
 
@@ -6435,7 +6466,17 @@ pub(crate) fn build_external_analyzer_fix_actions(
     }
 
     let range = lsp_range_to_byte_range(source, diagnostic.range);
-    let callable = callable_symbol_containing_range(file_symbols, range);
+    let callable = if let Some(range) = data.and_then(|data| data.owner_range) {
+        file_symbols.symbols.iter().find(|symbol| {
+            symbol.range == range
+                && matches!(
+                    symbol.kind,
+                    php_lsp_types::PhpSymbolKind::Method | php_lsp_types::PhpSymbolKind::Function
+                )
+        })
+    } else {
+        callable_symbol_containing_range(file_symbols, range)
+    };
     let fixes = data
         .into_iter()
         .flat_map(|data| data.analyzer_fixes.iter())
@@ -6480,7 +6521,14 @@ pub(crate) fn build_external_analyzer_fix_actions(
                         .map(|name| format!("${name}"))
                         .unwrap_or(variable);
                     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: format!("Add PHPDoc iterable value type for `{variable}`"),
+                        title: format!(
+                            "Add PHPDoc iterable value type for `{variable}`{}",
+                            if data.is_some_and(|data| data.snapshot.is_some()) {
+                                " (explicit mixed)"
+                            } else {
+                                ""
+                            }
+                        ),
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: Some(vec![diagnostic.clone()]),
                         edit: Some(edit),
@@ -6649,16 +6697,16 @@ impl PhpLspBackend {
         let diagnostics_mode = runtime_config.diagnostics_mode;
         let diagnostic_severity = runtime_config.diagnostic_severity;
         let diagnostic_budget = runtime_config.diagnostic_budget;
-        let Some(OpenDocumentSnapshot {
+        let Some(action_snapshot) = self.open_document_snapshot(&uri_str) else {
+            return Ok(Some(vec![]));
+        };
+        let OpenDocumentSnapshot {
             tree,
             source,
             document_state,
             file_symbols,
             ..
-        }) = self.open_document_snapshot(&uri_str)
-        else {
-            return Ok(Some(vec![]));
-        };
+        } = action_snapshot.clone();
         let document_version = document_state.map(|state| state.version);
 
         let constructor_action = if wants_generate_members {
@@ -6890,6 +6938,9 @@ impl PhpLspBackend {
         }
 
         if !wants_quickfix {
+            if self.runtime_state_snapshot().await.generation != request.state.generation {
+                return Ok(Some(vec![]));
+            }
             return Ok(Some(stamp_code_actions(
                 self,
                 &uri_str,
@@ -6933,8 +6984,33 @@ impl PhpLspBackend {
             Vec::new()
         };
 
-        for diagnostic in diagnostics {
+        let has_fix_metadata = diagnostics
+            .iter()
+            .any(|d| diagnostic_data(d).is_some_and(|data| data.snapshot.is_some()));
+        let fix_index_revision = request_index.revision_snapshot();
+        let regenerated = if has_fix_metadata && analyzer_code_actions.enabled {
+            Some(
+                self.attach_analyzer_fix_metadata(
+                    &request,
+                    &action_snapshot,
+                    &uri_str,
+                    diagnostics.clone(),
+                    &OperationCancellationToken::new(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        for (position, diagnostic) in diagnostics.into_iter().enumerate() {
             let data = diagnostic_data(&diagnostic);
+            if data.as_ref().is_some_and(|data| data.snapshot.is_some())
+                && !regenerated
+                    .as_ref()
+                    .is_some_and(|fresh| fresh[position].data == diagnostic.data)
+            {
+                continue;
+            }
             let analyzer = diagnostic_external_analyzer(&diagnostic);
 
             if analyzer.is_none_or(|_| analyzer_code_actions.enabled) {
@@ -7071,6 +7147,11 @@ impl PhpLspBackend {
             actions.push(action);
         }
 
+        if self.runtime_state_snapshot().await.generation != request.state.generation
+            || (has_fix_metadata && request_index.revision_snapshot() != fix_index_revision)
+        {
+            return Ok(Some(vec![]));
+        }
         Ok(Some(stamp_code_actions(
             self,
             &uri_str,

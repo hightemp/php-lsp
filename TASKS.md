@@ -6761,3 +6761,20 @@ change.
 - [x] **P240-004-2026-10-15** Preserve the original P2-40 finding, append implementation/status at that section, update relevant documentation and complete this milestone. *(done 2026-10-15)*
   - Implemented: README, architecture, LSP and test-evidence matrices describe source-safe edits, supported inherited contracts and limits. The original finding, other audit sections/Code Lens backlog and prior journal are preserved; 184 coverage links verified. Historical coverage percentages and production timings unchanged.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M; server-package CLI debug=0 overrides retain assertions. No parallel heavy checks, installed/remote changes or automatic commit.
+
+### Milestone: Production diagnostic quick-fix metadata (2026-10-15 -> 2026-10-15)
+
+**Статус:** complete *(done 2026-10-15)*
+**Цель:** Connect diagnostic producers to the existing throws, iterable PHPDoc, class-name and replacement code actions with source-validated metadata and real pipeline coverage.
+
+#### Задачи
+
+- [x] **QFM-001-2026-10-15** Inspect supported PHPStan/Psalm output and existing local helpers; add RED regressions from diagnostic production through applied code actions, without synthetic fix metadata. *(done 2026-10-15)*
+  - Implemented: 16 tests (6 unit, 10 protocol); initial RED uses ordinary analyzer JSON through command execution/publication rather than hand-authored fix metadata. Follow-up RED covers PHPDoc placement/newlines/multiline/reference tags, key/null contracts, candidate kinds and 144 position-index builds versus one.
+- [x] **QFM-002-2026-10-15** Produce conservative fix metadata from recognized diagnostics and verified current CST/symbol facts; preserve opt-in configuration, namespaces, source coordinates and stale-state rejection. *(done 2026-10-15)*
+  - Implemented: source-backed adapters for throws, explicit mixed parameter values, proven class-name corrections and function casing replacements. The user confirmed explicit mixed; iterable keys/nullability remain intact. Production metadata is regenerated in cancellable blocking work and checked against source/lifetime/runtime/index state. No new settings or cache schema.
+- [x] **QFM-003-2026-10-15** Cover missing/ambiguous suggestions, PHPDoc preservation, UTF-16/CRLF, document/dependency changes and pipeline publication; run sequential focused/full Rust checks and repeated gpt-6-astra Verifier until GO. *(done 2026-10-15)*
+  - Validation: controlled validation barriers cover index/runtime/edit/reopen and cancellation/permit release; 10 new protocol and all 23 existing code-action tests pass. Full Rust suite 1970 PASS / 0 FAIL / 0 ignored (67 blocks), Clippy -D warnings, Rustfmt and diff check PASS; five source hashes match. Repeated read-only gpt-6-astra Verifier GO. Fixture executables emit upstream-format JSON; installed analyzers are not executed. Artifacts: server/target/analyzer-actions-2026-10-15/ (ignored).
+- [x] **QFM-004-2026-10-15** Document user-visible actions and supported analyzer cases, preserve existing audit findings, append completion evidence and finish the milestone. *(done 2026-10-15)*
+  - Implemented: README, configuration supported-code table/upstream links, LSP matrix, architecture and test-evidence matrix updated; follow-up evidence appended within P2-40 without replacing its original finding/completion. Prior journal preserved and 186 coverage links checked; historical percentages/timings unchanged.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU and MemoryMax1536M/MemorySwapMax256M for builds/tests, server-package CLI debug=0 overrides with assertions retained. No parallel heavy checks, installed/remote server changes or automatic commit.

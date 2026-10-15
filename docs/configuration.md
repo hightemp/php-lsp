@@ -298,7 +298,35 @@ old request. Range formatting remains conservative: php-lsp formats only the
 selected fragment via a temporary file and does not run whole-document
 formatting for range requests.
 
+## Analyzer Quick Fixes
+
 Analyzer code actions are disabled by default. When
 `analyzerCodeActions.enabled` is true, PHPStan/Psalm diagnostics can offer local
 ignore comments and metadata-driven fixes such as missing `@throws`, iterable
 PHPDoc value types, and obvious prefixed class-name replacements.
+
+The normal analyzer publication pipeline now creates fix metadata for these
+recognized cases; a diagnostic must still match the current PHP source and
+symbol index:
+
+| Analyzer diagnostic | Offered action |
+|---|---|
+| PHPStan `missingType.checkedException`; Psalm `MissingThrowsDocblock` | Add the reported exception as an absolute `@throws` type on its named function/method. |
+| PHPStan `missingType.iterableValue` on a plain `array`/`iterable` parameter | Add an explicit unknown value type. The action says `(explicit mixed)`; it preserves nullable parameters and uses `array<array-key, mixed>` or `iterable<mixed, mixed>`. Existing richer contracts, variadics and promoted parameters are omitted. |
+| PHPStan `class.notFound`; Psalm `UndefinedClass`/`UndefinedInterface`/`UndefinedTrait` | Replace an unresolved qualified relative name with its existing absolute FQN, when no import alias competes and the candidate kind is legal in that position. |
+| PHPStan class/interface/trait/enum `.nameCase`; Psalm `InvalidClass` | Correct a class-like name to the indexed declaration's spelling when identity is proven. |
+| PHPStan `function.nameCase` | `Replace with …` corrects a function name to its existing absolute FQN and spelling, preserving arguments. |
+
+Messages that cannot be matched to the supported diagnostic/source facts,
+ambiguous locations and unsupported contexts produce no guessed fix. Throws
+and iterable adapters recognize specific message formats; name fixes require
+a supported diagnostic code and matching reference identity. Text in a
+deprecation notice is not interpreted as an automatic
+replacement recipe. Metadata is regenerated against the current source before
+returning edits; editing/reopening the document or changing relevant index or
+runtime state invalidates stale proposals. Analyzer commands and their trust
+settings retain their existing behavior.
+
+The adapters follow the upstream [PHPStan exception rule](https://github.com/phpstan/phpstan-src/blob/2.1.x/src/Rules/Exceptions/MissingCheckedExceptionInMethodThrowsRule.php),
+[function-name rule](https://github.com/phpstan/phpstan-src/blob/2.1.x/src/Rules/Functions/CallToNonExistentFunctionRule.php)
+and [Psalm missing-throws diagnostic](https://psalm.dev/docs/running_psalm/issues/MissingThrowsDocblock/).

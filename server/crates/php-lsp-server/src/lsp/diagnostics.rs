@@ -5050,6 +5050,17 @@ impl PhpLspBackend {
                                 .await,
                         );
                         if proof.matches_disk(Some(&analyzer_token)).await && !external.is_empty() {
+                            if let Some(snapshot) = snapshot.as_ref() {
+                                external = self
+                                    .attach_analyzer_fix_metadata(
+                                        &request,
+                                        snapshot,
+                                        &uri_str,
+                                        external,
+                                        &analyzer_token,
+                                    )
+                                    .await;
+                            }
                             diagnostics.extend(external);
                             expected_analyzer_source = Some(proof);
                         }

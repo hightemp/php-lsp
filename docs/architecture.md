@@ -589,6 +589,23 @@ not an atomic transaction with external filesystem writers. Versioned edits
 protect application to the target buffer when the client advertises support;
 clients without that capability retain the legacy edit format.
 
+`lsp/diagnostic_fixes.rs` connects external analyzer diagnostics to code-action
+metadata. After disk/editor equality checks, a cancellable worker matches known
+codes/messages against named callable scopes, current references and the
+workspace index. It records source fingerprint, URI, document version/lifetime,
+runtime generation and the exact owner/edit ranges. Reference collection is
+cancellable; callable ranges share one UTF-16 index per batch.
+
+Code-action requests regenerate produced metadata on the same bounded blocking
+path and require equality with the published proposal. Final runtime/index and
+document checks reject superseded work. Unknown/ambiguous facts produce no fix;
+ordinary diagnostics are retained when metadata computation is cancelled or
+invalidated. Existing direct metadata consumers remain compatible. PHPDoc edits
+preserve complete multiline tags, reference prefixes, descriptions, inline PHP
+placement and newline style. Explicit `mixed` does not narrow iterable key types
+or nullable native parameters. This is a finite set of diagnostic adapters, not
+general analyzer suggestion execution or automatic deprecation migration.
+
 ## Completion Context
 
 `UseStatement` completion retains the PHP import kind from the declaration or
