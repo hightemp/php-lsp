@@ -64,6 +64,12 @@ impl TemplateDocument {
         &self.virtual_source
     }
 
+    /// Every conversion creates new immutable virtual positions, including
+    /// context-only changes. Cloned snapshots retain this revision identity.
+    pub(crate) fn has_same_revision(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.virtual_positions, &other.virtual_positions)
+    }
+
     pub(crate) fn has_same_source_and_twig_context(&self, other: &Self) -> bool {
         self.kind == other.kind
             && self.original_source == other.original_source

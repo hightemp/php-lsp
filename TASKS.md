@@ -6812,3 +6812,20 @@ change.
 - [x] **DISPATCH-004-2026-10-16** Update architecture/test documentation and append completion evidence directly under audit item 2, preserving its original wording and explaining the nonconsecutive-version correction. *(done 2026-10-16)*
   - Implemented: architecture, README, LSP/test-evidence matrices and AGENTS explain the production dispatch boundary, quotas, ordering, cancellation and remaining native/codec limitations. Evidence appended directly under audit item 2; original audit and journal preserved; 224 local link targets verified. Linux checks only; no new production timing or coverage percentage.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU and MemoryMax1536M/MemorySwapMax256M for builds/tests; server-package CLI debug=0 keeps assertions. No parallel heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CLAUDE audit #3 Reuse document analysis (2026-10-16 -> 2026-10-16)
+
+**Статус:** complete *(done 2026-10-16)*
+**Цель:** Reuse immutable document analysis for one source version, remove duplicate index publication and diagnostic reparsing, and preserve document/runtime/lifetime consistency under concurrent edits.
+
+#### Задачи
+
+- [x] **ANALYSIS-001-2026-10-16** Add RED counters/regressions for repeated snapshot analysis, duplicate didChange index commits, diagnostic reparsing and multiple incremental edits in one notification. *(done 2026-10-16)*
+  - Validation: four initial RED failures reproduced duplicate parses/extractions/index writes, repeated snapshot copies and analysis in currentness checks. Additional RED covered cached budget-constrained references, debounce/hot-reader bypasses and stale excluded/overlapping roots.
+- [x] **ANALYSIS-002-2026-10-16** Share source/tree/analysis snapshots, reuse them for indexing and diagnostics, make publication-currentness checks cheap, and batch parser edits without changing LSP coordinate semantics. *(done 2026-10-16)*
+  - Implemented: shared immutable parsed snapshots, bounded URI/PHP-version source facts with lazy references, isolated cache fills, one PHP batch parse and current-runtime index publication before the notification fence. Diagnostics reuse matching source/tree/symbols; metadata validation uses coherent state/template identity. Schema 39 and settings unchanged.
+- [x] **ANALYSIS-003-2026-10-16** Verify version/configuration isolation, edit/close/reopen and stale publication with deterministic barriers; run focused/full sequential Rust gates and repeated gpt-6-astra Verifier to GO. *(done 2026-10-16)*
+  - Validation: 20 new tests (12 server, 8 parser); exact counters, concurrent readers and deterministic runtime/reopen/context/exclusion barriers. All server unit 690 and parser unit 625 PASS; full Rust suite 2060 PASS / 0 FAIL / 0 ignored (69 blocks), Clippy -D warnings, Rustfmt and diff check PASS. All 265 source/manifest hashes match the full-run input. Repeated read-only Verifier gpt-6-astra final GO. Artifacts: server/target/document-analysis-2026-10-16/ (ignored).
+- [x] **ANALYSIS-004-2026-10-16** Preserve audit wording, append evidence/status directly under item 3 and update relevant architecture/testing documentation before completing this milestone. *(done 2026-10-16)*
+  - Implemented: architecture, LSP/test-evidence matrices and AGENTS describe snapshot ownership, batching, cache purity/bounds, commit ordering and remaining limits. Evidence appended directly under original audit item 3; previous audit/journal retained; 234 local link targets verified. No new production latency or coverage-percentage measurement.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU and MemoryMax1536M/MemorySwapMax256M; no parallel heavy checks, remote/installed server changes or automatic commit.

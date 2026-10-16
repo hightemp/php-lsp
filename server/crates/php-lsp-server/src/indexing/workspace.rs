@@ -2555,9 +2555,9 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
                     continue;
                 }
             }
-            let mut diagnostics = compute_source_diagnostics_blocking(
+            let mut diagnostics = compute_snapshot_diagnostics_blocking(
                 uri_str.clone(),
-                snapshot.source.clone(),
+                snapshot.parsed.clone(),
                 config.index.clone(),
                 diagnostics_config,
                 version,

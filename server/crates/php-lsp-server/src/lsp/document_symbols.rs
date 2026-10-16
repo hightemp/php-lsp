@@ -360,27 +360,22 @@ impl PhpLspBackend {
         let php_version = request.runtime_config().php_version;
 
         // Try open files first, then fall back to index
-        let (file_symbols, source) = if let Some(parser) = self.open_files.get(&uri_str) {
-            if let Some(tree) = parser.tree() {
-                let source = parser.source();
-                (
-                    extract_file_symbols_for_php_version(
-                        tree,
-                        &source,
-                        &uri_str,
-                        symbol_extraction_version(php_version),
-                    ),
-                    source,
-                )
-            } else {
-                return Ok(None);
-            }
+        let (file_symbols, source, positions) = if let Some(snapshot) =
+            self.open_document_snapshot_for_php_version(&uri_str, php_version)
+        {
+            (
+                snapshot.file_symbols,
+                snapshot.source,
+                snapshot.parsed.line_index(),
+            )
+        } else if self.open_files.contains_key(&uri_str) {
+            return Ok(None);
         } else if let Some(file_symbols) = {
             let published = self.index.read();
             published
                 .file_symbols()
                 .get(&uri_str)
-                .map(|entry| entry.value().as_ref().clone())
+                .map(|entry| entry.value().clone())
         } {
             let Some(source) = self
                 .source_for_uri(&uri_str, "documentSymbol source read")
@@ -388,7 +383,8 @@ impl PhpLspBackend {
             else {
                 return Ok(None);
             };
-            (file_symbols, source)
+            let positions = Arc::new(Utf16LineIndex::new(&source));
+            (file_symbols, Arc::<str>::from(source), positions)
         } else {
             return Ok(None);
         };
@@ -425,7 +421,6 @@ impl PhpLspBackend {
         }
 
         // Helper to convert SymbolInfo range to LSP Range
-        let positions = Utf16LineIndex::new(&source);
         let to_range = |range| range_from_lsp_tuple(positions.range_to_lsp(range));
 
         // Build DocumentSymbol for a symbol with its children

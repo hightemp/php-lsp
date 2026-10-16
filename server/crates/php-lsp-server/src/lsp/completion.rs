@@ -166,6 +166,7 @@ impl PhpLspBackend {
             template_document,
             document_state,
             file_symbols,
+            ..
         }) = self
             .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
         else {

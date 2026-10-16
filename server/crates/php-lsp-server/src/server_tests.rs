@@ -137,7 +137,7 @@ fn open_document_snapshot_is_atomic_and_staged_file_stays_out_of_global_index() 
     writer.join().expect("snapshot writer");
     writer_committed_rx.recv().expect("writer committed");
 
-    assert_eq!(old_snapshot.source, old_template.virtual_source());
+    assert_eq!(old_snapshot.source.as_ref(), old_template.virtual_source());
     assert_eq!(
         old_snapshot
             .template_document
@@ -164,7 +164,7 @@ fn open_document_snapshot_is_atomic_and_staged_file_stays_out_of_global_index() 
         uri,
     )
     .expect("new snapshot");
-    assert_eq!(new_snapshot.source, new_template.virtual_source());
+    assert_eq!(new_snapshot.source.as_ref(), new_template.virtual_source());
     assert_eq!(
         new_snapshot
             .template_document

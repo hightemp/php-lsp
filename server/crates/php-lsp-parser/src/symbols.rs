@@ -51,6 +51,11 @@ pub(crate) fn extract_root_symbols(
     uri: &str,
     php_version: Option<PhpSymbolExtractionVersion>,
 ) -> FileSymbols {
+    #[cfg(any(test, feature = "test-instrumentation"))]
+    crate::analysis_metrics::record(
+        crate::analysis_metrics::Work::Symbols,
+        if uri.is_empty() { source } else { uri },
+    );
     if crate::control::is_cancelled() {
         return FileSymbols::default();
     }

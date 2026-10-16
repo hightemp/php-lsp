@@ -158,7 +158,7 @@ async fn p233_valid_template_batch_uses_each_preceding_edit_as_its_base() {
         let template = after.template_document.unwrap();
         assert_eq!(after.document_state.unwrap().version, 2);
         assert_eq!(template.original_source(), "😀\r\n{{ 2.75 }}");
-        assert_eq!(template.virtual_source(), after.source);
+        assert_eq!(template.virtual_source(), after.source.as_ref());
         assert!(!backend.documents_requiring_full_sync.contains_key(uri));
         backend.lsp_shutdown().await.unwrap();
     }
@@ -297,7 +297,7 @@ async fn p233_concurrent_invalid_edits_and_full_sync_keep_coherent_snapshots() {
                 for _ in 0..8 {
                     let snapshot = service.inner().open_document_snapshot(uri).unwrap();
                     let template = snapshot.template_document.unwrap();
-                    assert_eq!(snapshot.source, template.virtual_source());
+                    assert_eq!(snapshot.source.as_ref(), template.virtual_source());
                     if snapshot.document_state == before.document_state {
                         assert_eq!(snapshot.source, before.source);
                         assert_eq!(

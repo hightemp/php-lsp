@@ -24,6 +24,15 @@ pub struct FunctionNameScope<'a> {
     borrowed_source: PhantomData<(&'a str, Node<'a>)>,
 }
 impl<'a> FunctionNameScope<'a> {
+    /// Start persistent source-only analysis without inheriting external proofs.
+    pub(crate) fn isolate() -> Self {
+        Self {
+            previous: ACTIVE.with(|active| active.borrow_mut().take()),
+            owner: true,
+            borrowed_source: PhantomData,
+        }
+    }
+
     pub fn enter(
         node: Node<'a>,
         source: &'a str,

@@ -221,6 +221,8 @@ pub fn collect_symbol_references_in_file_cancellable(
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<Vec<SymbolReference>> {
+    #[cfg(any(test, feature = "test-instrumentation"))]
+    crate::analysis_metrics::record(crate::analysis_metrics::Work::References, source);
     if cancelled() {
         return None;
     }

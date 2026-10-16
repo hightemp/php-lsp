@@ -173,6 +173,8 @@
 - Production transports must use `php_lsp_server::dispatch::serve`; direct `LspService` tests exercise feature behavior but do not prove transport responsiveness.
 - Keep CPU/admission permits owned until physical poll completion and response receipt/drop. Dropping a cancellation response must not release a running worker's capacity or a reused-ID predecessor fence.
 - Document notification fences release after authoritative mutation/capture and required cleanup, before slow post-processing. Preserve this boundary when changing open/change/save/close; never infer lost changes from nonconsecutive LSP versions.
+- Reuse `FileParser::snapshot()` and its source facts for open-document analysis. Capture parser/template/version together, release the parser map guard before extracting facts, and keep `didChange`'s fence until current-runtime index synchronization finishes.
+- Persistent source facts must be keyed by logical URI and extraction PHP version, bounded per parsed revision, and independent of external function proofs. Do not cache cancelled fills or reference results constrained by an outer inference budget. Publication-currentness checks read coherent metadata rather than rebuilding analysis.
 - Do not add unbounded blocking filesystem or process work directly in async LSP request handlers.
 - Use existing blocking helpers or `tokio::task::spawn_blocking` for expensive filesystem/parser/diagnostic work.
 - Drop `DashMap` guards and other locks before any `.await`.

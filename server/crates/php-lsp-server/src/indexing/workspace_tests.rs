@@ -526,7 +526,7 @@ fn open_php_index_and_parser_commit_has_no_reader_gap() {
     reader.join().expect("PHP reader joined");
 
     assert_eq!(indexed_names, vec!["newName"]);
-    assert_eq!(source, new_source);
+    assert_eq!(source.as_ref(), new_source);
     assert_eq!(snapshot_names, vec!["newName"]);
     assert_eq!(
         state,

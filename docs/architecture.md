@@ -286,9 +286,13 @@ Outbound LSP handlers must convert byte-backed ranges with
 `php_lsp_parser::utf16::range_byte_to_utf16` or `Utf16LineIndex`. Do not return
 `SymbolInfo.range` or `selection_range` directly as an LSP `Range`.
 Completion context detection and CST lookup receive complete Tree-sitter points.
-`FileParser` keeps its position index alongside the Rope and tree and rebuilds
-it after each accepted edit. Ropey enables `cr_lines`, without `unicode_lines`;
-edit offsets come from `LineIndex`, and `InputEdit` points count only LF.
+`FileParser` publishes an immutable source/tree/position snapshot after each
+accepted PHP edit batch. Edits are staged on a cloned Rope and tree, with one
+incremental parse through Rope chunks and one final position-index build.
+The first ranged edit uses the existing `LineIndex`; subsequent ranges use the
+staged Rope's LSP lines. Ropey enables `cr_lines`, without `unicode_lines`, and
+`InputEdit` points count only LF. A full replacement resets the incremental base;
+a rejected batch leaves the old snapshot intact.
 Columns beyond content clamp before its terminator; surrogate-half positions
 floor to the scalar start. Empty and trailing EOF lines remain representable.
 No line-ending normalization is performed.
@@ -621,11 +625,38 @@ class is actually present in the index, and later sessions can reload that file
 from the `vendor` cache namespace.
 
 For open documents, the parser entry is the per-URI synchronization boundary.
-Request paths that combine parser, source, template, version, and symbol state
-capture coherent tree/source/template/version inputs while holding that entry's
-read guard, then derive one `OpenDocumentSnapshot` from those clones. Writers
-publish companion state and the live index while holding the write entry, so a
-request cannot combine a new symbol index with an older editor buffer.
+`FileParser` owns a `ParsedSnapshot` (`php-lsp-parser/src/parsed.rs`) containing
+shared source text, its immutable CST and coordinate index. A new accepted edit
+publishes a new snapshot; existing readers retain their previous revision.
+`OpenDocumentCapture` obtains that handle, template and version/generation under
+the parser read guard without extracting symbols. `OpenDocumentSnapshot` adds
+shared source facts after releasing that guard.
+
+Each parsed revision caches up to four logical-URI/PHP-extraction-version
+variants. Symbols and resolver-free references are populated lazily; evicted
+variants may be recomputed. The cache never inherits external function proofs,
+and a reference fill under an already-active inference budget is not retained.
+Cancellation or panic cannot publish a partial successful cache entry. Workspace
+lookups and diagnostic results remain dependent on current runtime/index state,
+and are not stored in this source-only cache.
+
+PHP `didChange` prepares source facts outside parser/global publication locks,
+then synchronizes the applicable aggregate/root indexes once. Final publication
+holds the runtime and aggregate coordination locks, revalidates document state
+under the parser guard and clears excluded targets. A concurrent configuration
+change can require a different PHP-version variant during that final synchronous
+section; there is no await while those commit locks are held. The transport's
+document fence is released only after synchronization, so later document-dependent
+requests cannot overtake the commit. This is not an atomic snapshot of every
+workspace dependency for an already-running request.
+
+Diagnostics reuse the parsed source/tree, matching versioned symbols and position
+index. Publication-currentness checks inspect document state and immutable template
+revision identity under the parser guard, without extracting symbols or copying
+source text. A Twig context-only refresh changes that identity even when editor
+version and original text stay the same. The 180 ms diagnostic debounce and
+incremental Twig context refresh remain in place; no settings or disk-cache schema
+changed.
 
 ## Feature Ownership Map
 
@@ -998,13 +1029,13 @@ plus state containing the LSP version and a monotonically increasing
 document-lifetime generation. A new generation distinguishes a reopened
 document even when the client resets its LSP version.
 
-Request paths that need combined state capture a cloned tree, source text,
-optional template/source-map state, and version/generation state under the
-parser-entry guard, then derive symbols and construct an
-`OpenDocumentSnapshot` from those coherent clones. Open/change/rename writers
-update the parser, template, state, and live index while holding the entry write
-guard. Index publication uses the same generation/version ordering, so cache
-loads, watcher work, or an older parse cannot overwrite a newer editor buffer.
+Request paths capture the shared parsed revision, optional template/source-map
+state and version/generation under the parser-entry guard. Symbol/reference facts
+are reused from that immutable revision. Text publication and final index commit
+both validate document identity; expensive preparation runs outside the parser
+map guard. The transport commit fence orders subsequent document-dependent reads.
+Cache loads, watcher work and closed-file restoration retain their separate
+version/generation and indexing-run checks.
 
 On `textDocument/didOpen`:
 
@@ -1016,12 +1047,14 @@ On `textDocument/didOpen`:
 
 On `textDocument/didChange`:
 
-- Incremental LSP edits are applied to the existing parser entry.
+- PHP LSP edits are applied sequentially to staged text, with one parse after
+  the batch; a full replacement can be followed by ranged edits.
 - Document generations and versions are checked so stale changes or background
   results are ignored.
-- Symbols, references, template state, and open-buffer index state are
-  refreshed under the same parser-entry write guard.
-- Fast diagnostics are debounced and published only for the latest known version.
+- Source facts are prepared once per cached URI/PHP-version variant and committed
+  to the current applicable indexes with document-state validation.
+- Fast diagnostics reuse the parsed revision, are debounced and publish only
+  when their document/runtime/indexing context remains current.
 - Any running external analyzer for that document is cancelled.
 
 On `textDocument/didSave`:

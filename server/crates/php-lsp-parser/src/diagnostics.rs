@@ -28,9 +28,16 @@ pub fn extract_syntax_errors_utf16(
     tree: &tree_sitter::Tree,
     source: &str,
 ) -> Vec<Utf16SyntaxDiagnostic> {
+    extract_syntax_errors_with_positions(tree, &Utf16LineIndex::new(source))
+}
+
+/// Reuse the coordinate index belonging to the same immutable source snapshot.
+pub fn extract_syntax_errors_with_positions(
+    tree: &tree_sitter::Tree,
+    positions: &Utf16LineIndex,
+) -> Vec<Utf16SyntaxDiagnostic> {
     let mut diagnostics = Vec::new();
-    let utf16_index = Utf16LineIndex::new(source);
-    collect_errors(tree.root_node(), &utf16_index, &mut diagnostics);
+    collect_errors(tree.root_node(), positions, &mut diagnostics);
     diagnostics
 }
 

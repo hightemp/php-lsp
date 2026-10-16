@@ -755,7 +755,6 @@ impl PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let request = self.request_context_for_uri(&uri_str).await;
         let request_index = request.index(&self.index);
-        let extraction_version = symbol_extraction_version(request.runtime_config().php_version);
         let version = params.text_document.version;
 
         #[cfg(test)]
@@ -842,59 +841,25 @@ impl PhpLspBackend {
                     None
                 };
 
-                let indexed_file = if template_change.is_none() {
-                    let parser = entry.get_mut();
-                    for change in &params.content_changes {
-                        if let Some(range) = change.range {
-                            if let Err(error) = parser.apply_edit(
-                                range.start.line,
-                                range.start.character,
-                                range.end.line,
-                                range.end.character,
-                                &change.text,
-                            ) {
-                                self.documents_requiring_full_sync
-                                    .insert(uri_str.clone(), current.generation);
-                                tracing::error!(
-                                    "Rejected didChange for {} version {} after range preflight: {}",
-                                    uri_str,
-                                    version,
-                                    error
-                                );
-                                return;
-                            }
-                        } else {
-                            parser.parse_full(&change.text);
-                        }
-                    }
-                    parser.tree().map(|tree| {
-                        let source = parser.source();
-                        let file_symbols = extract_file_symbols_for_php_version(
-                            tree,
-                            &source,
-                            &uri_str,
-                            extraction_version,
-                        );
-                        let references =
-                            collect_symbol_references_in_file(tree, &source, &file_symbols);
-                        (file_symbols, references)
-                    })
-                } else {
-                    None
-                };
-
                 if template_change.is_none() {
-                    if let Some((file_symbols, references)) = indexed_file {
-                        update_aggregate_and_root_index(
-                            &self.index,
-                            &request_index,
-                            &uri_str,
-                            file_symbols,
-                            references,
-                            None,
-                        );
-                    } else {
-                        remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
+                    let edits: Vec<_> = params
+                        .content_changes
+                        .iter()
+                        .map(|change| php_lsp_parser::parser::SourceEdit {
+                            range: change.range.map(|range| {
+                                (
+                                    (range.start.line, range.start.character),
+                                    (range.end.line, range.end.character),
+                                )
+                            }),
+                            text: &change.text,
+                        })
+                        .collect();
+                    if let Err(error) = entry.get_mut().apply_edits(&edits) {
+                        self.documents_requiring_full_sync
+                            .insert(uri_str.clone(), current.generation);
+                        tracing::error!("Rejected didChange for {}: {}", uri_str, error);
+                        return;
                     }
                 }
 
@@ -910,6 +875,16 @@ impl PhpLspBackend {
             }
         };
 
+        if !self
+            .synchronize_open_document_index_to_current_runtime(
+                &uri_str,
+                document_state,
+                template_change.is_none(),
+            )
+            .await
+        {
+            return;
+        }
         crate::dispatch::document_committed();
         #[cfg(test)]
         crate::dispatch::test_document_post(&uri_str, "change").await;
@@ -928,12 +903,6 @@ impl PhpLspBackend {
 
         if let Some(refresh_twig_contexts) = template_change {
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
-            if !self
-                .synchronize_open_document_index_to_current_runtime(&uri_str, document_state, false)
-                .await
-            {
-                return;
-            }
             self.schedule_fast_diagnostics(uri, document_state).await;
             if refresh_twig_contexts
                 && self.current_document_state(&uri_str) == Some(document_state)
@@ -943,31 +912,6 @@ impl PhpLspBackend {
                 self.refresh_open_twig_contexts_and_republish_diagnostics()
                     .await;
             }
-            return;
-        }
-
-        let excluded = if let Some(path) = uri_to_path(&uri_str) {
-            self.path_is_excluded_by_config(&path).await
-        } else {
-            false
-        };
-
-        if excluded {
-            let dashmap::mapref::entry::Entry::Occupied(_entry) =
-                self.open_files.entry(uri_str.clone())
-            else {
-                return;
-            };
-            if self.current_document_state(&uri_str) != Some(document_state) {
-                return;
-            }
-            remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
-        }
-
-        if !self
-            .synchronize_open_document_index_to_current_runtime(&uri_str, document_state, true)
-            .await
-        {
             return;
         }
 
@@ -1269,19 +1213,17 @@ pub(in crate::server) async fn filter_lazy_resolved_symbol_diagnostics_with_cont
     filtered
 }
 
-pub(in crate::server) async fn compute_source_diagnostics_blocking(
+pub(in crate::server) async fn compute_snapshot_diagnostics_blocking(
     uri_str: String,
-    source: String,
+    parsed: Arc<php_lsp_parser::parsed::ParsedSnapshot>,
     index: Arc<WorkspaceIndex>,
     diagnostics_config: DiagnosticsRuntimeConfig,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
     run_diagnostics_blocking(uri_str.clone(), document_version, move || {
-        let mut parser = FileParser::new();
-        parser.parse_full(&source);
-        compute_diagnostics_with_config_for_version(
+        compute_snapshot_diagnostics(
             &uri_str,
-            &parser,
+            &parsed,
             &index,
             diagnostics_config,
             document_version,
@@ -1340,6 +1282,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(in crate::server) fn current_parser_symbol_references(
     uri_str: &str,
     parser: &FileParser,
@@ -1577,6 +1520,22 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     diagnostics_config: DiagnosticsRuntimeConfig,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
+    compute_snapshot_diagnostics(
+        uri_str,
+        &parser.snapshot(),
+        index,
+        diagnostics_config,
+        document_version,
+    )
+}
+
+fn compute_snapshot_diagnostics(
+    uri_str: &str,
+    parsed: &php_lsp_parser::parsed::ParsedSnapshot,
+    index: &WorkspaceIndex,
+    diagnostics_config: DiagnosticsRuntimeConfig,
+    document_version: Option<i32>,
+) -> Vec<Diagnostic> {
     let diagnostics_started = Instant::now();
     if diagnostics_config.mode == DiagnosticsMode::Off {
         return vec![];
@@ -1584,17 +1543,18 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     let diagnostic_severity = diagnostics_config.severity;
     let php_version = diagnostics_config.php_version;
 
-    let tree = match parser.tree() {
+    let tree = match parsed.tree() {
         Some(t) => t,
         None => return vec![],
     };
-    let source = parser.source();
-    let utf16_index = Utf16LineIndex::new(&source);
+    let source = parsed.source();
+    let utf16_index = parsed.line_index();
     let type_cache = RequestTypeCache::new(uri_str, document_version);
     let framework_cache = crate::framework::FrameworkProviderCache::default();
 
     // Syntax errors (ERROR / MISSING nodes)
-    let lsp_diags = extract_syntax_errors_utf16(tree, &source);
+    let lsp_diags =
+        php_lsp_parser::diagnostics::extract_syntax_errors_with_positions(tree, &utf16_index);
     let mut diagnostics: Vec<Diagnostic> = lsp_diags
         .into_iter()
         .map(|d| {
@@ -1623,12 +1583,11 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     }
 
     // Semantic diagnostics (unknown class, function, unresolved use)
-    let file_symbols = index
-        .read()
-        .file_symbols()
-        .get(uri_str)
-        .map(|entry| entry.value().clone())
-        .unwrap_or_default();
+    let Some(analysis) = parsed.analysis(uri_str, Some(symbol_extraction_version(php_version)))
+    else {
+        return diagnostics;
+    };
+    let file_symbols = analysis.symbols();
 
     let semantic_started = Instant::now();
     let sem_diags =
@@ -4898,41 +4857,13 @@ impl PhpLspBackend {
         }
     }
 
-    pub(in crate::server) fn references_for_file(
-        &self,
-        index: &WorkspaceIndex,
-        file_uri: &str,
-        target_fqn: &str,
-        target_kind: php_lsp_types::PhpSymbolKind,
-        include_declaration: bool,
-    ) -> Vec<php_lsp_types::SymbolReference> {
-        let mut refs = if let Some(parser) = self.open_files.get(file_uri) {
-            current_parser_symbol_references(file_uri, &parser)
-        } else {
-            index
-                .read()
-                .file_references()
-                .get(file_uri)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_default()
-        };
-        refs.retain(|reference| {
-            symbol_reference_matches(
-                index,
-                reference,
-                target_fqn,
-                target_kind,
-                include_declaration,
-            )
-        });
-        refs
-    }
-
     /// Publish diagnostics for a file.
     pub(in crate::server) async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
         let computation_sequence = self.diagnostics_publisher.start_computation(&uri_str);
-        let snapshot = self.open_document_snapshot(&uri_str);
+        let request = self.request_context_for_uri(&uri_str).await;
+        let snapshot = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version);
         let document_state = snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.document_state);
@@ -4941,7 +4872,6 @@ impl PhpLspBackend {
             .and_then(|snapshot| snapshot.template_document.clone());
         let source = snapshot.as_ref().map(|snapshot| snapshot.source.clone());
         let version = document_state.map(|state| state.version);
-        let request = self.request_context_for_uri(&uri_str).await;
         let runtime_config = request.runtime_config().clone();
         let request_index = request.index(&self.index);
         let indexing_workspace_folder = request
@@ -4985,10 +4915,10 @@ impl PhpLspBackend {
             budget: diagnostic_budget,
             php_version,
         };
-        let mut diagnostics = if let Some(source) = source.as_ref() {
-            compute_source_diagnostics_blocking(
+        let mut diagnostics = if let Some(snapshot) = snapshot.as_ref() {
+            compute_snapshot_diagnostics_blocking(
                 uri_str.clone(),
-                source.clone(),
+                snapshot.parsed.clone(),
                 request_index.clone(),
                 diagnostics_config,
                 version,
@@ -5016,10 +4946,10 @@ impl PhpLspBackend {
         {
             effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
             diagnostics_config.mode = effective_diagnostics_mode;
-            diagnostics = if let Some(source) = source.as_ref() {
-                compute_source_diagnostics_blocking(
+            diagnostics = if let Some(snapshot) = snapshot.as_ref() {
+                compute_snapshot_diagnostics_blocking(
                     uri_str.clone(),
-                    source.clone(),
+                    snapshot.parsed.clone(),
                     request_index.clone(),
                     diagnostics_config,
                     version,
@@ -5105,10 +5035,10 @@ impl PhpLspBackend {
         {
             effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
             diagnostics_config.mode = effective_diagnostics_mode;
-            diagnostics = if let Some(source) = source.as_ref() {
-                compute_source_diagnostics_blocking(
+            diagnostics = if let Some(snapshot) = snapshot.as_ref() {
+                compute_snapshot_diagnostics_blocking(
                     uri_str.clone(),
-                    source.clone(),
+                    snapshot.parsed.clone(),
                     request_index.clone(),
                     diagnostics_config,
                     version,

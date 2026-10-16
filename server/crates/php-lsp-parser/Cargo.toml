@@ -14,3 +14,6 @@ tree-sitter-php = { workspace = true }
 ropey = { workspace = true }
 lsp-types = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+test-instrumentation = []

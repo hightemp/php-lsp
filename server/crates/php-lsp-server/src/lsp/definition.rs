@@ -145,7 +145,8 @@ impl PhpLspBackend {
             template_document,
             file_symbols,
             ..
-        }) = self.open_document_snapshot(&uri_str)
+        }) = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
         else {
             return Ok(None);
         };
@@ -372,7 +373,8 @@ impl PhpLspBackend {
             template_document,
             file_symbols,
             ..
-        }) = self.open_document_snapshot(&uri_str)
+        }) = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
         else {
             return Ok(None);
         };
@@ -559,7 +561,9 @@ impl PhpLspBackend {
             template_document,
             document_state,
             file_symbols,
-        }) = self.open_document_snapshot(&uri_str)
+            ..
+        }) = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
         else {
             return Ok(None);
         };
@@ -1051,11 +1055,14 @@ impl PhpLspBackend {
         pos: Position,
     ) -> Option<GotoDefinitionResponse> {
         let uri_str = uri.as_str().to_string();
-        let parser = self.open_files.get(&uri_str)?;
-        let tree = parser.tree()?;
-        let source = parser.source();
-        let (byte_line, byte_col) = lsp_position_to_byte_point(&source, pos.line, pos.character);
-        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let snapshot = self.open_document_snapshot(&uri_str)?;
+        let tree = &snapshot.tree;
+        let source = snapshot.source.clone();
+        let (byte_line, byte_col) = snapshot
+            .parsed
+            .line_index()
+            .position_to_point(pos.line, pos.character);
+        let file_symbols = snapshot.file_symbols;
         let scoped_symbols = file_symbols.scoped_at_byte_position(byte_line, byte_col);
         let sym = symbol_at_position(tree, &source, byte_line, byte_col, &scoped_symbols)?;
         let use_stmt = imported_use_statement_for_symbol(&scoped_symbols, &sym)?;
@@ -1076,7 +1083,7 @@ impl PhpLspBackend {
         uri_str: &str,
     ) -> Option<php_lsp_types::FileSymbols> {
         if let Some(snapshot) = self.open_document_snapshot(uri_str) {
-            return Some(snapshot.file_symbols);
+            return Some(snapshot.file_symbols.as_ref().clone());
         }
 
         if let Some(file_symbols) = index.read().file_symbols().get(uri_str) {
@@ -1261,7 +1268,7 @@ impl PhpLspBackend {
                 && candidate.doc_comment == symbol.doc_comment
         };
         if let Some(snapshot) = self.open_document_snapshot(&symbol.uri) {
-            if snapshot.source != source
+            if snapshot.source.as_ref() != source
                 || !snapshot.file_symbols.symbols.iter().any(matches_symbol)
             {
                 return None;

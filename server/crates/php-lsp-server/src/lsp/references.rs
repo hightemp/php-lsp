@@ -186,7 +186,7 @@ impl PhpLspBackend {
     fn open_symbol_authority(&self, uri: &str) -> OpenSymbolAuthority {
         if let Some(snapshot) = self.open_document_snapshot(uri) {
             if snapshot.template_document.is_none() {
-                OpenSymbolAuthority::Ordinary(snapshot.file_symbols)
+                OpenSymbolAuthority::Ordinary(snapshot.file_symbols.as_ref().clone())
             } else {
                 OpenSymbolAuthority::NonOrdinary
             }
@@ -406,18 +406,16 @@ impl PhpLspBackend {
         let request_index = request.index(&self.index);
         let pos = params.text_document_position_params.position;
 
-        let parser = match self.open_files.get(&uri_str) {
-            Some(parser) => parser,
-            None => return Ok(None),
+        let Some(snapshot) = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
+        else {
+            return Ok(None);
         };
-        let tree = match parser.tree() {
-            Some(tree) => tree,
-            None => return Ok(None),
-        };
-        let source = parser.source();
-        let positions = Utf16LineIndex::new(&source);
+        let tree = &snapshot.tree;
+        let source = snapshot.source.clone();
+        let positions = snapshot.parsed.line_index();
         let (byte_line, byte_col) = positions.position_to_point(pos.line, pos.character);
-        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let file_symbols = snapshot.file_symbols.clone();
         let sym = match symbol_at_position(tree, &source, byte_line, byte_col, &file_symbols) {
             Some(sym) => sym,
             None => return Ok(None),
@@ -464,9 +462,20 @@ impl PhpLspBackend {
             target_kind,
             php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::GlobalConstant
         ) {
-            let highlights: Vec<DocumentHighlight> = self
-                .references_for_file(&request_index, &uri_str, &target_fqn, target_kind, true)
-                .into_iter()
+            let Some(references) = snapshot.analysis.references() else {
+                return Ok(None);
+            };
+            let highlights: Vec<DocumentHighlight> = references
+                .iter()
+                .filter(|reference| {
+                    symbol_reference_matches(
+                        &request_index,
+                        reference,
+                        &target_fqn,
+                        target_kind,
+                        true,
+                    )
+                })
                 .map(|reference| DocumentHighlight {
                     range: range_from_lsp_tuple(reference.range),
                     kind: Some(DocumentHighlightKind::TEXT),
@@ -513,18 +522,17 @@ impl PhpLspBackend {
 
         // Resolve symbol under cursor to get FQN
         let (target_fqn, target_kind) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(None),
+            let Some(snapshot) = self.open_document_snapshot_for_php_version(
+                &uri_str,
+                request.runtime_config().php_version,
+            ) else {
+                return Ok(None);
             };
-            let tree = match parser.tree() {
-                Some(t) => t,
-                None => return Ok(None),
-            };
-            let source = parser.source();
-            let positions = Utf16LineIndex::new(&source);
+            let tree = &snapshot.tree;
+            let source = snapshot.source.clone();
+            let positions = snapshot.parsed.line_index();
             let (byte_line, byte_col) = positions.position_to_point(pos.line, pos.character);
-            let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+            let file_symbols = snapshot.file_symbols.clone();
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 resolve_member_type_from_index(&request_index, class_fqn, member_name)

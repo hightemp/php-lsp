@@ -27,6 +27,14 @@ thread_local! {
     }) };
 }
 
+/// A nested inference operation may have already spent its source budget.
+/// Such a fill must not persist its context-dependent incomplete references.
+pub(crate) fn independent_source_analysis() -> bool {
+    WORK.with(|work| work.get().file_remaining.is_none())
+        && super::OBJECT_TYPE_RESOLVE_DEPTH.with(Cell::get) == 0
+        && super::CST_TYPE_SCAN_DEPTH.with(Cell::get) == 0
+}
+
 pub(super) fn begin() {
     WORK.with(|work| {
         let mut state = work.get();
@@ -221,6 +229,40 @@ pub(super) fn remaining() -> usize {
 mod tests {
     use super::*;
     use crate::resolve::within_type_resolution_budget;
+
+    #[test]
+    fn analysis_nested_exhausted_budget_cannot_poison_persistent_references() {
+        let source = "<?php class Foo {function work(){}} $x=new Foo; $x->work();";
+        let mut parser = crate::parser::FileParser::new();
+        parser.parse_full(source);
+        let parsed = parser.snapshot();
+        let facts = parsed.analysis("file:///budget-facts.php", None).unwrap();
+        let plain = crate::references::collect_symbol_references_in_file(
+            parsed.tree().unwrap(),
+            &parsed.source,
+            &facts.symbols,
+        );
+        let outer = FileInferenceBudget::for_tree(parsed.tree().unwrap().root_node());
+        for _ in 0..32 {
+            let _scope = CallableInferenceBudget::enter();
+            let _ = within_type_resolution_budget::<()>(|| {
+                while consume() {}
+                None
+            });
+        }
+        assert_eq!(remaining(), 0);
+        let bounded = facts.references().unwrap();
+        assert_ne!(
+            *bounded, plain,
+            "fixture must exercise budget-dependent inference"
+        );
+        drop(outer);
+        assert_eq!(
+            *facts.references().unwrap(),
+            plain,
+            "partial nested facts survived into a fresh operation"
+        );
+    }
 
     #[test]
     fn coverage_report_counts_limits_and_resets_for_another_file() {

@@ -163,7 +163,7 @@ impl Input {
             sources.insert(
                 file_uri.clone(),
                 OpenSource {
-                    symbols: snapshot.file_symbols,
+                    symbols: snapshot.file_symbols.as_ref().clone(),
                     references,
                 },
             );
@@ -190,7 +190,7 @@ impl Input {
             }
             (
                 symbols.as_ref().clone(),
-                String::from_utf8(bytes).ok()?,
+                Arc::<str>::from(String::from_utf8(bytes).ok()?),
                 Some((path, fingerprint)),
             )
         };

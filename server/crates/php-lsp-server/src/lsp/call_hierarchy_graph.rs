@@ -382,7 +382,7 @@ impl PhpLspBackend {
                 let references = php_lsp_parser::references::collect_symbol_references_in_file_with_resolvers(
                     &snapshot.tree,&snapshot.source,&snapshot.file_symbols,Some(&member),Some(&callable));
                 if cancel.is_cancelled() { return None; }
-                Some(OpenCalls { symbols: snapshot.file_symbols, references, state: snapshot.document_state,
+                Some(OpenCalls { symbols: snapshot.file_symbols.as_ref().clone(), references, state: snapshot.document_state,
                     fingerprint: SourceFingerprint::from_bytes(snapshot.source.as_bytes()) })
             }).await.ok().flatten()?;
             open.insert(uri, captured);

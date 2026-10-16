@@ -28,7 +28,7 @@ client-visible LSP behavior and known limits.
 |---|---|---|
 | `initialize` / `initialized` | Supported | Applies initialization options, loads stubs, starts background indexing, publishes status notifications. |
 | `textDocument/didOpen` | Supported | Parses editor text and atomically publishes the applicable parser/template/version and PHP-index state before diagnostics. |
-| `textDocument/didChange` | Supported | Serialized incremental parser edits with exact LF/CRLF/CR positions and Unicode separators retained as content, index refresh, stale generation/version rejection, and debounced fast diagnostics. |
+| `textDocument/didChange` | Supported | Serialized PHP edit batches with one parse, exact LF/CRLF/CR positions and Unicode separators retained as content, shared source facts, current-runtime index commit, stale generation/version rejection, and debounced diagnostics reusing the parsed revision. |
 | `textDocument/didSave` | Supported | Publishes full diagnostics, including enabled external analyzers. |
 | `textDocument/didClose` | Supported | Removes open parser/template/version state and its open-buffer index entry, clears request/diagnostic state, and guarded-restores saved disk symbols for ordinary PHP unless the URI is reopened first. |
 | `workspace/didChangeWatchedFiles` | Supported | Changed/created PHP files use authoritative open-buffer state when present; deleted PHP files are removed. |

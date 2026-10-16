@@ -8,6 +8,7 @@ mod cst;
 pub mod diagnostics;
 pub mod function_names;
 pub mod line_index;
+pub mod parsed;
 pub mod parser;
 pub mod phpdoc;
 pub mod references;
@@ -20,3 +21,6 @@ pub mod symbols;
 pub mod type_contract;
 pub mod utf16;
 pub mod variable_scope;
+
+#[cfg(any(test, feature = "test-instrumentation"))]
+pub mod analysis_metrics;
