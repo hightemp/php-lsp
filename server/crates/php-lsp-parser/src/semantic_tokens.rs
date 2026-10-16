@@ -99,7 +99,6 @@ fn collect_node_tokens(
     if let Some((token_type, token_modifiers_bitset)) = classify_node(node, source) {
         push_node_tokens(
             node,
-            source,
             utf16_index,
             token_type,
             token_modifiers_bitset,
@@ -116,88 +115,22 @@ fn collect_node_tokens(
 
 fn push_node_tokens(
     node: Node,
-    source: &str,
-    utf16_index: &Utf16LineIndex,
+    index: &Utf16LineIndex,
     token_type: u32,
     token_modifiers_bitset: u32,
     tokens: &mut Vec<AbsoluteSemanticToken>,
 ) {
-    let start = node.start_position();
-    let end = node.end_position();
-    let start_line = start.row as u32;
-    let end_line = end.row as u32;
-
-    if start_line == end_line {
-        push_line_token(
-            start_line,
-            start.column as u32,
-            end.column as u32,
-            utf16_index,
-            token_type,
-            token_modifiers_bitset,
-            tokens,
-        );
-        return;
+    for (line, start, end) in index.segments(node.start_byte(), node.end_byte()) {
+        if end > start {
+            tokens.push(AbsoluteSemanticToken {
+                line,
+                start,
+                length: end - start,
+                token_type,
+                token_modifiers_bitset,
+            });
+        }
     }
-
-    for line in start_line..=end_line {
-        let start_col = if line == start_line {
-            start.column as u32
-        } else {
-            0
-        };
-        let end_col = if line == end_line {
-            end.column as u32
-        } else {
-            line_byte_len(source, line)
-        };
-        push_line_token(
-            line,
-            start_col,
-            end_col,
-            utf16_index,
-            token_type,
-            token_modifiers_bitset,
-            tokens,
-        );
-    }
-}
-
-fn push_line_token(
-    line: u32,
-    start_byte_col: u32,
-    end_byte_col: u32,
-    utf16_index: &Utf16LineIndex,
-    token_type: u32,
-    token_modifiers_bitset: u32,
-    tokens: &mut Vec<AbsoluteSemanticToken>,
-) {
-    if end_byte_col <= start_byte_col {
-        return;
-    }
-
-    let start = utf16_index.byte_col_to_utf16(line, start_byte_col);
-    let end = utf16_index.byte_col_to_utf16(line, end_byte_col);
-    let length = end.saturating_sub(start);
-    if length == 0 {
-        return;
-    }
-
-    tokens.push(AbsoluteSemanticToken {
-        line,
-        start,
-        length,
-        token_type,
-        token_modifiers_bitset,
-    });
-}
-
-fn line_byte_len(source: &str, line: u32) -> u32 {
-    source
-        .split('\n')
-        .nth(line as usize)
-        .map(str::len)
-        .unwrap_or_default() as u32
 }
 
 fn normalize_tokens(mut tokens: Vec<AbsoluteSemanticToken>) -> Vec<AbsoluteSemanticToken> {

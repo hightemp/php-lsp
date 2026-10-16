@@ -49,17 +49,18 @@ fn folding_range_for_node(
 
     let start = node.start_position();
     let end = node.end_position();
-    let start_line = start.row as u32;
-    let end_line = end.row as u32;
+    let (start_line, start_column) =
+        utf16_index.point_to_position(start.row as u32, start.column as u32);
+    let (end_line, end_column) = utf16_index.point_to_position(end.row as u32, end.column as u32);
     if end_line <= start_line {
         return None;
     }
 
     Some(FoldingRange {
         start_line,
-        start_character: Some(utf16_index.byte_col_to_utf16(start_line, start.column as u32)),
+        start_character: Some(start_column),
         end_line,
-        end_character: Some(utf16_index.byte_col_to_utf16(end_line, end.column as u32)),
+        end_character: Some(end_column),
         kind,
         collapsed_text: None,
     })

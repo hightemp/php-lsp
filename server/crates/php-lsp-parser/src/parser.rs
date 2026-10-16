@@ -1,6 +1,6 @@
 //! FileParser: tree-sitter + ropey::Rope for incremental PHP parsing.
 
-use crate::utf16::utf16_col_to_byte_chars;
+use crate::line_index::LineIndex;
 use ropey::Rope;
 use std::fmt;
 use tree_sitter::{InputEdit, Parser, Point, Tree};
@@ -31,6 +31,7 @@ pub struct FileParser {
     parser: Parser,
     tree: Option<Tree>,
     rope: Rope,
+    lines: LineIndex,
 }
 
 impl FileParser {
@@ -45,12 +46,14 @@ impl FileParser {
             parser,
             tree: None,
             rope: Rope::new(),
+            lines: LineIndex::new(""),
         }
     }
 
     /// Full parse of a source string (used on didOpen).
     pub fn parse_full(&mut self, source: &str) {
         self.rope = Rope::from_str(source);
+        self.lines = LineIndex::new(source);
         let source_bytes = source.as_bytes();
         self.tree = self.parser.parse(source_bytes, None);
     }
@@ -58,8 +61,8 @@ impl FileParser {
     /// Apply an incremental edit from LSP didChange and reparse.
     ///
     /// LSP positions use (line, character) where `character` is measured in
-    /// **UTF-16 code units**.  Tree-sitter and ropey work in bytes, so we must
-    /// convert before applying the edit.
+    /// **UTF-16 code units**. Convert to source bytes for Tree-sitter and to
+    /// Rope character offsets for editing; CST rows advance only at LF.
     pub fn apply_edit(
         &mut self,
         start_line: u32,
@@ -75,22 +78,19 @@ impl FileParser {
             });
         }
 
-        let start_line = start_line as usize;
-        let start_char = start_char as usize;
-        let end_line = end_line as usize;
-        let end_char = end_char as usize;
-
-        // Calculate byte offsets from rope (UTF-16 → byte).
-        let start_byte = self.utf16_position_to_byte(start_line, start_char);
-        let old_end_byte = self.utf16_position_to_byte(end_line, end_char);
+        let start_byte = self
+            .lines
+            .position_to_offset(start_line, start_char)
+            .unwrap_or(self.lines.len_bytes());
+        let old_end_byte = self
+            .lines
+            .position_to_offset(end_line, end_char)
+            .unwrap_or(self.lines.len_bytes());
         debug_assert!(start_byte <= old_end_byte);
-
-        // Tree-sitter Points need byte columns (byte offset from line start).
-        let start_byte_col = start_byte - self.line_start_byte(start_line);
-        let old_end_byte_col = old_end_byte - self.line_start_byte(end_line);
-
-        let start_point = Point::new(start_line, start_byte_col);
-        let old_end_point = Point::new(end_line, old_end_byte_col);
+        let start = self.lines.offset_to_point(start_byte);
+        let old_end = self.lines.offset_to_point(old_end_byte);
+        let start_point = Point::new(start.0 as usize, start.1 as usize);
+        let old_end_point = Point::new(old_end.0 as usize, old_end.1 as usize);
 
         // Apply the edit to the rope
         let start_char_idx = self.rope.byte_to_char(start_byte);
@@ -100,11 +100,12 @@ impl FileParser {
 
         // Calculate new end position
         let new_end_byte = start_byte + new_text.len();
-        let new_end_line = self
-            .rope
-            .byte_to_line(new_end_byte.min(self.rope.len_bytes()));
-        let new_end_byte_col = new_end_byte - self.line_start_byte(new_end_line);
-        let new_end_point = Point::new(new_end_line, new_end_byte_col);
+        let newlines = new_text.bytes().filter(|byte| *byte == b'\n').count();
+        let new_column = match new_text.rfind('\n') {
+            Some(i) => new_text.len() - i - 1,
+            None => start_point.column + new_text.len(),
+        };
+        let new_end_point = Point::new(start_point.row + newlines, new_column);
 
         // Apply edit to tree-sitter tree for incremental reparsing
         if let Some(tree) = &mut self.tree {
@@ -120,6 +121,7 @@ impl FileParser {
 
         // Reparse incrementally
         let source = self.rope.to_string();
+        self.lines = LineIndex::new(&source);
         self.tree = self.parser.parse(source.as_bytes(), self.tree.as_ref());
         Ok(())
     }
@@ -139,51 +141,14 @@ impl FileParser {
         &self.rope
     }
 
-    /// Convert (line, utf16_character) to byte offset in the rope.
-    ///
-    /// LSP `Position.character` is measured in UTF-16 code units.
-    /// For ASCII this is the same as byte offset, but for multi-byte characters
-    /// (Cyrillic, CJK, emoji, etc.) it differs.
-    fn utf16_position_to_byte(&self, line: usize, utf16_char: usize) -> usize {
-        if line >= self.rope.len_lines() {
-            return self.rope.len_bytes();
-        }
-        let line_start = self.rope.line_to_byte(line);
-        line_start
-            + utf16_col_to_byte_chars(self.rope.line(line).chars(), utf16_char as u32) as usize
+    pub fn line_index(&self) -> &LineIndex {
+        &self.lines
     }
 
-    /// Get the byte offset of the start of a line.
-    fn line_start_byte(&self, line: usize) -> usize {
-        if line >= self.rope.len_lines() {
-            return self.rope.len_bytes();
-        }
-        self.rope.line_to_byte(line)
-    }
-
-    /// Convert (line, byte_column) to (line, utf16_character) for LSP.
-    ///
-    /// Tree-sitter positions use byte columns; LSP uses UTF-16 code unit columns.
+    /// Legacy column-only API. Full protocol conversions use `line_index()`.
+    #[deprecated(note = "Use line_index().point_to_position for full coordinate conversion")]
     pub fn byte_col_to_utf16(&self, line: u32, byte_col: u32) -> u32 {
-        let line = line as usize;
-        if line >= self.rope.len_lines() {
-            return byte_col;
-        }
-        let line_slice = self.rope.line(line);
-        let byte_col = byte_col as usize;
-
-        let mut utf16_offset: usize = 0;
-        let mut byte_offset: usize = 0;
-
-        for ch in line_slice.chars() {
-            if byte_offset >= byte_col {
-                break;
-            }
-            byte_offset += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-
-        utf16_offset as u32
+        self.lines.point_to_position(line, byte_col).1
     }
 }
 
@@ -196,3 +161,7 @@ impl Default for FileParser {
 #[cfg(test)]
 #[path = "parser_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "document_line_tests.rs"]
+mod document_line_tests;

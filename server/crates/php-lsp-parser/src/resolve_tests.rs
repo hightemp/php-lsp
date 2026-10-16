@@ -256,19 +256,22 @@ fn find_line_col(code: &str, needle: &str) -> (u32, u32) {
 }
 
 #[test]
-fn test_position_to_byte_handles_crlf() {
+fn test_byte_position_to_offset_handles_crlf() {
     let source = "<?php\r\n$first = 1;\r\n$second = $first;\r\n";
     let expected = source.find("$second").unwrap();
 
-    assert_eq!(position_to_byte(source, 2, 0), expected);
+    assert_eq!(byte_position_to_offset(source, 2, 0), expected);
 }
 
 #[test]
-fn test_position_to_byte_converts_utf16_character() {
-    let source = "<?php\n$emoji = \"😀\";\n$result = $emoji;\n";
+fn test_byte_position_to_offset_preserves_cst_column_after_unicode() {
+    let source = "<?php\n/* 😀 */ $result = 1;\n";
     let expected = source.find("$result").unwrap();
-
-    assert_eq!(position_to_byte(source, 2, 0), expected);
+    let line_start = source.find('\n').unwrap() + 1;
+    assert_eq!(
+        byte_position_to_offset(source, 1, (expected - line_start) as u32),
+        expected
+    );
 }
 
 struct ObjectTypeResolveDepthReset {
@@ -3011,5 +3014,22 @@ namespace App {
             !display.contains(rejected),
             "section {occurrence}: {display}"
         );
+    }
+}
+
+#[test]
+fn line_model_line_comments_end_at_each_php_line_ending() {
+    for eol in ["\n", "\r\n", "\r"] {
+        for comment in ["//", "#"] {
+            assert!(argument_text_is_null_literal(&format!(
+                "null {comment} ignored{eol}"
+            )));
+            assert!(
+                !argument_text_is_null_literal(&format!(
+                    "null {comment} ignored{eol} ?? $callback"
+                )),
+                "{eol:?}"
+            );
+        }
     }
 }

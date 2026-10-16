@@ -8,7 +8,7 @@ use crate::server::{
     DiagnosticsRuntimeConfig, PhpVersion,
 };
 use crate::util::fs_walk::{FileWalkOutcome, TraversalLimits, TraversalStopReason};
-use crate::util::lsp_text::{lsp_position_to_byte, text_at_lsp_range};
+use crate::util::lsp_text::{lsp_position_to_byte, position_from_byte_point, text_at_lsp_range};
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;
@@ -20,7 +20,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tower_lsp::ls_types::{Diagnostic, Position, Range, TextEdit, Uri, WorkspaceEdit};
+use tower_lsp::ls_types::{Diagnostic, Range, TextEdit, Uri, WorkspaceEdit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixFormat {
@@ -613,10 +613,10 @@ fn add_return_type_actions(
         .into_iter()
         .filter_map(|candidate| {
             let hint = return_type_hint(&candidate.return_type, php_version)?;
-            let position = Position::new(
+            let position = position_from_byte_point(
+                &utf16_index,
                 candidate.insert_position.0,
-                utf16_index
-                    .byte_col_to_utf16(candidate.insert_position.0, candidate.insert_position.1),
+                candidate.insert_position.1,
             );
             Some(FixAction {
                 rule: FixRule::AddReturnType,

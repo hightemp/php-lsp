@@ -91,7 +91,8 @@ impl PhpLspBackend {
 
         let (sym_at_pos, active_parameter) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let (byte_line, byte_col) =
+                lsp_position_to_byte_point(&source, pos.line, pos.character);
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 resolve_member_type_from_index(&request_index, class_fqn, member_name)
@@ -100,7 +101,7 @@ impl PhpLspBackend {
             let context = match signature_help_context_at_position(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -202,9 +203,9 @@ impl PhpLspBackend {
         };
         tracing::debug!("completion: {}:{}:{}", uri_str, pos.line, pos.character);
 
-        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let (byte_line, byte_col) = lsp_position_to_byte_point(&source, pos.line, pos.character);
         let framework_string_key_context =
-            framework_string_key_context_at_position(&source, pos.line, byte_col);
+            framework_string_key_context_at_position(&source, byte_line, byte_col);
         let framework_string_key_items =
             if let Some(ref framework_string_key_context) = framework_string_key_context {
                 self.framework_string_key_items(&request, framework_string_key_context)
@@ -215,7 +216,8 @@ impl PhpLspBackend {
         let type_cache = RequestTypeCache::new(&uri_str, document_state.map(|state| state.version));
 
         // Detect completion context
-        let context = detect_context_at_byte_col(&tree, &source, pos.line, byte_col, &file_symbols);
+        let context =
+            detect_context_at_byte_col(&tree, &source, byte_line, byte_col, &file_symbols);
         if let php_lsp_completion::context::CompletionContext::MemberAccess {
             object_expr, ..
         } = &context
@@ -223,7 +225,7 @@ impl PhpLspBackend {
             if let Some(node) = super::composite_receivers::completion_node(
                 &tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 object_expr,
             ) {
@@ -252,7 +254,7 @@ impl PhpLspBackend {
                         &uri_str,
                         &source,
                         &file_symbols,
-                        pos.line,
+                        byte_line,
                         byte_col,
                         &type_cache,
                     )
@@ -294,7 +296,7 @@ impl PhpLspBackend {
             source: &source,
             file_symbols: &file_symbols,
             type_cache: &type_cache,
-            line: pos.line,
+            line: byte_line,
             byte_col,
         };
 
@@ -314,7 +316,7 @@ impl PhpLspBackend {
                     &context,
                     &request_index,
                     &file_symbols,
-                    (pos.line, byte_col, pos.line, byte_col),
+                    (byte_line, byte_col, byte_line, byte_col),
                 ),
             }
         };
@@ -328,7 +330,7 @@ impl PhpLspBackend {
                 &mut lsp_items,
                 &tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 prefix,
             );
@@ -412,16 +414,16 @@ impl PhpLspBackend {
                 &source,
                 &file_symbols,
                 &request_index,
-                pos.line,
+                byte_line,
                 byte_col,
                 object_expr,
             ) {
-                let scoped = file_symbols.scoped_at_byte_position(pos.line, byte_col);
+                let scoped = file_symbols.scoped_at_byte_position(byte_line, byte_col);
                 lsp_items = super::composite_receivers::members_for_access(
                     &request_index,
                     &scoped,
                     &receiver,
-                    Some((pos.line, byte_col, pos.line, byte_col)),
+                    Some((byte_line, byte_col, byte_line, byte_col)),
                     *access_mode,
                 )
                 .into_values()
@@ -438,7 +440,7 @@ impl PhpLspBackend {
                 php_lsp_completion::context::CompletionContext::Free { .. }
                     | php_lsp_completion::context::CompletionContext::Namespace { .. }
             );
-        let auto_import_file_symbols = file_symbols.scoped_at_byte_position(pos.line, byte_col);
+        let auto_import_file_symbols = file_symbols.scoped_at_byte_position(byte_line, byte_col);
 
         // Convert lsp_types::CompletionItem to ls_types::CompletionItem
         // We need to map between the two different type systems
@@ -465,7 +467,7 @@ impl PhpLspBackend {
                         auto_import_file_symbols.as_ref(),
                         &symbol,
                         prefix,
-                        pos.line,
+                        byte_line,
                         byte_col,
                     )?;
                     item.insert_text = Some(prepared.insert_text);

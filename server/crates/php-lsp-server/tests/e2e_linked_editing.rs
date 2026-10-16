@@ -249,16 +249,13 @@ async fn linked_editing_ranges_drive_incremental_edits_without_changing_import_p
     let mut changes = Vec::new();
     for range in ranges.iter().rev() {
         assert_eq!(range["start"]["line"], 0);
-        let start = php_lsp_parser::utf16::utf16_col_to_byte(
-            &source,
-            0,
-            range["start"]["character"].as_u64().unwrap() as u32,
-        ) as usize;
-        let end = php_lsp_parser::utf16::utf16_col_to_byte(
-            &source,
-            0,
-            range["end"]["character"].as_u64().unwrap() as u32,
-        ) as usize;
+        let index = php_lsp_parser::utf16::Utf16LineIndex::new(&source);
+        let start = index
+            .position_to_offset(0, range["start"]["character"].as_u64().unwrap() as u32)
+            .unwrap();
+        let end = index
+            .position_to_offset(0, range["end"]["character"].as_u64().unwrap() as u32)
+            .unwrap();
         source.replace_range(start..end, "Renamed");
         changes.push(json!({"range":range,"text":"Renamed"}));
     }

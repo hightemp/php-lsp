@@ -1007,12 +1007,7 @@ struct ReferenceCollector<'a> {
 }
 impl ReferenceCollector<'_> {
     fn range_tuple(&self, range: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-        (
-            range.0,
-            self.positions.byte_col_to_utf16(range.0, range.1),
-            range.2,
-            self.positions.byte_col_to_utf16(range.2, range.3),
-        )
+        self.positions.range_to_lsp(range)
     }
     fn range(&self, node: Node<'_>) -> (u32, u32, u32, u32) {
         self.range_tuple(node_range(node))

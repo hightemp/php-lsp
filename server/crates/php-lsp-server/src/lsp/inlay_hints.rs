@@ -153,12 +153,11 @@ fn map_inlay_hints_to_template_original(
 }
 
 fn full_document_range(source: &str) -> Range {
-    let line = source.bytes().filter(|byte| *byte == b'\n').count() as u32;
-    let line_start = source.rfind('\n').map_or(0, |idx| idx + 1);
-    Range {
-        start: Position::new(0, 0),
-        end: Position::new(line, source[line_start..].encode_utf16().count() as u32),
-    }
+    let positions = Utf16LineIndex::new(source);
+    Range::new(
+        Position::new(0, 0),
+        position_from_offset(&positions, source.len()),
+    )
 }
 
 fn position_in_range(position: Position, range: Range) -> bool {
@@ -320,14 +319,18 @@ fn scope_end_inlay_hint(ctx: &InlayHintContext<'_>, node: tree_sitter::Node) -> 
         return None;
     }
 
-    let start_line = scope_node.start_position().row as u32;
-    if line.saturating_sub(start_line) < min_lines {
+    let start_line = ctx
+        .utf16_index
+        .offset_to_position(scope_node.start_byte())
+        .0;
+    let end_line = ctx.utf16_index.offset_to_position(hint_byte).0;
+    if end_line.saturating_sub(start_line) < min_lines {
         return None;
     }
 
     let label = scope_end_hint_label(scope_node, ctx.source)?;
     Some(InlayHint {
-        position: Position::new(line, ctx.utf16_index.byte_col_to_utf16(line, byte_col)),
+        position: position_from_byte_point(ctx.utf16_index, line, byte_col),
         label: InlayHintLabel::String(label.clone()),
         kind: None,
         text_edits: None,
@@ -576,10 +579,7 @@ pub(in crate::server) fn add_call_argument_inlay_hints(
         }
         let start = argument.value_node.start_position();
         hints.push(InlayHint {
-            position: Position::new(
-                start.row as u32,
-                utf16_index.byte_col_to_utf16(start.row as u32, start.column as u32),
-            ),
+            position: position_from_byte_point(utf16_index, start.row as u32, start.column as u32),
             label: InlayHintLabel::String(format!("{}:", param.name)),
             kind: Some(InlayHintKind::PARAMETER),
             text_edits: None,
@@ -771,11 +771,7 @@ pub(in crate::server) fn add_local_variable_type_inlay_hint(
     }
 
     let end = variable_node.end_position();
-    let position = Position::new(
-        end.row as u32,
-        ctx.utf16_index
-            .byte_col_to_utf16(end.row as u32, end.column as u32),
-    );
+    let position = position_from_byte_point(ctx.utf16_index, end.row as u32, end.column as u32);
     let label_text = format!(": {}", type_hint.display);
     if !seen.insert((position.line, position.character, label_text)) {
         return;
@@ -4220,10 +4216,7 @@ pub(in crate::server) fn add_phpdoc_parameter_type_inlay_hints(
         };
         let end = name_node.end_position();
         hints.push(InlayHint {
-            position: Position::new(
-                end.row as u32,
-                utf16_index.byte_col_to_utf16(end.row as u32, end.column as u32),
-            ),
+            position: position_from_byte_point(utf16_index, end.row as u32, end.column as u32),
             label: InlayHintLabel::String(format!(": {}", type_info)),
             kind: Some(InlayHintKind::TYPE),
             text_edits: None,
@@ -4258,10 +4251,10 @@ pub(in crate::server) fn collect_phpdoc_return_type_inlay_hints(
         let label = return_type_hint(&candidate.return_type, php_version)
             .unwrap_or_else(|| candidate.return_type.to_string());
         hints.push(InlayHint {
-            position: Position::new(
+            position: position_from_byte_point(
+                utf16_index,
                 candidate.insert_position.0,
-                utf16_index
-                    .byte_col_to_utf16(candidate.insert_position.0, candidate.insert_position.1),
+                candidate.insert_position.1,
             ),
             label: InlayHintLabel::String(format!(": {}", label)),
             kind: Some(InlayHintKind::TYPE),

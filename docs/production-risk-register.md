@@ -59,7 +59,7 @@ Impact:
 
 - The recorded 2026-05-28 run met the `<5s` warm-start target on the primary
   5k-10k PHP-file workspace. This historical workspace has not been remeasured
-  with current schema 38. Separate schema-36/37 incident profiles and the
+  with current schema 39. Separate schema-36/37 incident profiles and the
   P2-32 Laravel validation are recorded in `production-baseline.md`.
 - Changed-file invalidation remains covered by tests and normal dogfood watch,
   but is no longer considered a blocking production risk.

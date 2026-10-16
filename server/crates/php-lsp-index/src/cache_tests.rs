@@ -6,9 +6,104 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 38;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 39;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x984a69ed93131785;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0xb28d2979bee1948;
+
+#[test]
+fn line_model_cache_rejects_schema_38_coordinate_snapshots() {
+    let root = unique_temp_dir("old-line-model");
+    let file = root.join("Foo.php");
+    let source = "<?php\rfunction foo() {}\rfoo();\r";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols =
+        php_lsp_parser::symbols::extract_file_symbols(parser.tree().unwrap(), source, &uri);
+    let references = php_lsp_parser::references::collect_symbol_references_in_file(
+        parser.tree().unwrap(),
+        source,
+        &symbols,
+    );
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, references);
+    let config = test_config();
+    let mut cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    cache.schema_version = 38;
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(
+        report.loaded_files, 0,
+        "old LF-only reference ranges must not survive migration"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn line_model_cache_roundtrip_preserves_lsp_reference_and_phpdoc_ranges() {
+    let root = unique_temp_dir("new-line-model");
+    let file = root.join("Foo.php");
+    let source = "<?php\r/**\r * @deprecated\r */\rfunction foo() {}\rfoo();\r";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols =
+        php_lsp_parser::symbols::extract_file_symbols(parser.tree().unwrap(), source, &uri);
+    assert_eq!(
+        symbols
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .unwrap()
+            .doc_comment_range,
+        Some((1, 0, 3, 3))
+    );
+    let references = php_lsp_parser::references::collect_symbol_references_in_file(
+        parser.tree().unwrap(),
+        source,
+        &symbols,
+    );
+    assert!(
+        references
+            .iter()
+            .any(|r| !r.is_declaration && r.target_fqn == "foo" && r.range == (5, 0, 5, 3)),
+        "{references:?}"
+    );
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, references.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+    assert_eq!(
+        *restored.read().file_references().get(&uri).unwrap(),
+        references
+    );
+    assert_eq!(
+        restored.resolve_fqn("foo").unwrap().doc_comment_range,
+        Some((1, 0, 3, 3))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(

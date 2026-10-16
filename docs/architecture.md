@@ -137,6 +137,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_initialize.rs` | initialize/shutdown, runtime configuration, project config trust. |
 | `tests/e2e_logging.rs` | real stdio binary stderr filtering, initialization overrides, inherited/invalid RUST_LOG and separate CLI stdout. |
 | `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
+| `tests/e2e_document_lines.rs` | exact incremental text and complete coordinate conversion for LF/CRLF/CR, Unicode separators, navigation/edits/diagnostics/tokens/templates and external-edit guards. |
 | `tests/e2e_completion_identity.rs` | provider docs/resolve, import collisions and aliases, accepted-edit definition identity, qualified/inline/group/declare layouts, UTF-16/CRLF and bounded edit/reopen orders. |
 | `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
@@ -189,8 +190,12 @@ crate boundaries.
 
 ### Position Model
 
-Tree-sitter declaration ranges use byte columns. LSP ranges and recorded
-PHPDoc spans use UTF-16 columns.
+`php-lsp-parser/src/line_index.rs` owns conversion between source byte offsets,
+Tree-sitter points and LSP positions without changing source bytes. Tree-sitter
+rows advance only at LF and columns count bytes. LSP lines advance at LF, CRLF
+or bare CR and columns count UTF-16 units. LS/PS/NEL/VT/FF are ordinary content.
+Convert both row and column; a column-only conversion is insufficient for CR.
+The legacy column-only helpers are deprecated and have no production callers.
 
 | Data | Position unit |
 |---|---|
@@ -209,12 +214,21 @@ PHPDoc spans use UTF-16 columns.
 Outbound LSP handlers must convert byte-backed ranges with
 `php_lsp_parser::utf16::range_byte_to_utf16` or `Utf16LineIndex`. Do not return
 `SymbolInfo.range` or `selection_range` directly as an LSP `Range`.
-Completion context detection receives byte columns after the server converts
-LSP UTF-16 positions and clamps them to valid UTF-8 boundaries before slicing,
-so non-ASCII text and CRLF line endings do not change the internal unit model.
-Incremental edits use the same UTF-16-to-byte boundary policy directly over
-RopeSlice characters: positions beyond line content stop before LF/CRLF, and
-positions inside a surrogate pair resolve to the scalar's start.
+Completion context detection and CST lookup receive complete Tree-sitter points.
+`FileParser` keeps its position index alongside the Rope and tree and rebuilds
+it after each accepted edit. Ropey enables `cr_lines`, without `unicode_lines`;
+edit offsets come from `LineIndex`, and `InputEdit` points count only LF.
+Columns beyond content clamp before its terminator; surrogate-half positions
+floor to the scalar start. Empty and trailing EOF lines remain representable.
+No line-ending normalization is performed.
+
+Batch producers reuse an index for symbol/reference/token conversions. Template
+snapshots share immutable original/virtual position indexes. Workspace symbols
+and hierarchy response batches cache position indexes per URI for that request;
+these caches do not outlive their source snapshot/request. Semantic tokens split
+at logical content boundaries and never include CR/LF bytes. Stored LSP ranges
+(`SymbolReference`, attached PHPDoc and syntax diagnostics) are not converted
+again. Cache schema 39 rebuilds snapshots produced by the old line model.
 
 ### URI Model
 
@@ -445,8 +459,8 @@ targets, assignment/update/unset targets and proven builtin output arguments
 are writes; receiver/index expressions, closure capture tokens and ordinary
 arguments remain reads. Property containers use the same writable-target rules.
 Function identity facts are shared once per operation, with index evidence for
-namespaced builtin fallback. Roles are not serialized; reference/cache schema
-38 is unchanged. Reference collection builds one UTF-16 line index per source,
+namespaced builtin fallback. Roles are not serialized; they do not add fields
+to the cache format. Reference collection builds one UTF-16 line index per source,
 using binary search for Unicode columns, and supports cancellation between CST
 nodes without returning a partial successful collection.
 
@@ -605,6 +619,12 @@ preserve complete multiline tags, reference prefixes, descriptions, inline PHP
 placement and newline style. Explicit `mixed` does not narrow iterable key types
 or nullable native parameters. This is a finite set of diagnostic adapters, not
 general analyzer suggestion execution or automatic deprecation migration.
+Sources containing bare CR do not receive external-analyzer edit actions,
+including legacy replacement/ignore actions. The producer and consumer enforce
+this boundary until analyzer-specific line conventions have a verified adapter.
+External diagnostics still publish with the existing analyzer adapter; their
+bare-CR coordinates are not guaranteed. Built-in diagnostics and normal
+LF/CRLF analyzer actions retain their coordinate contract.
 
 ## Completion Context
 
@@ -1275,10 +1295,11 @@ lossy key normalization. Schema 36 invalidated receiver references
 derived from premature foreach bindings or partial inference beyond the work
 and depth budgets. Schema 37 invalidated receivers derived from stale
 assignments, incorrect foreach targets/destructuring or lost namespace aliases,
-and references omitted by unfair file-budget consumption. Current schema 38
-invalidates foreign-builtin receivers and nullable/framework call results
-derived by the former helpers. These semantic changes did not alter the
-serialized field layout.
+and references omitted by unfair file-budget consumption. Schema 38 invalidated
+foreign-builtin receivers and nullable/framework call results derived by the
+former helpers. Current schema 39 invalidates reference/PHPDoc coordinates and
+bindings produced with the old document line model. These semantic changes did
+not alter the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

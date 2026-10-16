@@ -6778,3 +6778,20 @@ change.
 - [x] **QFM-004-2026-10-15** Document user-visible actions and supported analyzer cases, preserve existing audit findings, append completion evidence and finish the milestone. *(done 2026-10-15)*
   - Implemented: README, configuration supported-code table/upstream links, LSP matrix, architecture and test-evidence matrix updated; follow-up evidence appended within P2-40 without replacing its original finding/completion. Prior journal preserved and 186 coverage links checked; historical percentages/timings unchanged.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU and MemoryMax1536M/MemorySwapMax256M for builds/tests, server-package CLI debug=0 overrides with assertions retained. No parallel heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CLAUDE audit #1 Document line-model consistency (2026-10-15 -> 2026-10-15)
+
+**Статус:** complete *(done 2026-10-15)*
+**Цель:** Preserve exact editor text under incremental edits and consistently translate LSP LF/CRLF/CR positions to Tree-sitter LF-based points, treating Unicode separators as ordinary content.
+
+#### Задачи
+
+- [x] **LINE-001-2026-10-15** Add RED parser/source/tree-equivalence and LSP regressions for LS/PS/NEL/VT/FF, LF/CRLF/bare CR, mixed endings, UTF-16 boundaries and sequential edits. *(done 2026-10-15)*
+  - Implemented: 34 new regressions. Initial RED: 3 parser failures plus 5 protocol failures; further RED exposed PHPDoc name leakage, CR lexical/refactor boundaries, unsafe external edits and repeated index construction. Exact raw-source/CST comparison uses an independent client line oracle.
+- [x] **LINE-002-2026-10-15** Reuse/extend shared text-position indexing for byte offsets, LSP positions and Tree-sitter points; remove Ropey's extra Unicode line boundaries and migrate affected request/response conversions without normalizing source contents. *(done 2026-10-15)*
+  - Implemented: cached LineIndex preserves raw source, separates LSP LF/CRLF/CR from Tree-sitter LF rows and converts both row/column components. All production column-only consumers migrated; template/batch indices reused; cache schema 39 rejects old coordinate snapshots. External analyzer edit actions fail closed on bare CR; their published CR ranges remain unverified.
+- [x] **LINE-003-2026-10-15** Verify symbols/navigation/diagnostics/edits/templates and lifecycle ordering, cache compatibility and bounded batch conversion; run sequential focused/full Rust checks and repeated gpt-6-astra Verifier to GO. *(done 2026-10-15)*
+  - Validation: 34 focused tests and final full Rust suite 2004 PASS / 0 FAIL / 0 ignored (68 blocks); Clippy -D warnings, Rustfmt and diff check PASS. Controlled parser/template barriers, source-index counters and cache replay included. All 255 final source hashes match. Repeated read-only gpt-6-astra Verifier final GO. Artifacts: server/target/document-lines-2026-10-15/ (ignored). Linux evidence only; no new large-workspace timing or coverage percentage measurement.
+- [x] **LINE-004-2026-10-15** Preserve the original finding and append completion evidence directly under item 1 in audit/CLAUDE-AUDIT-2026-10-15.md; update relevant architecture/features/testing documentation and complete this milestone. *(done 2026-10-15)*
+  - Implemented: completion and evidence placed directly under audit item 1, preserving its full original wording; summary status updated. Architecture, AGENTS position rules, README, LSP/configuration/test-evidence docs and current-cache performance notes updated. Original task journal preserved; documentation links checked.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU and MemoryMax1536M/MemorySwapMax256M for builds/tests; server-package CLI debug=0 retains assertions. No parallel heavy checks, installed/remote server changes or automatic commit.

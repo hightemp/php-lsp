@@ -156,8 +156,9 @@
 ## Architecture Rules
 
 ### Ranges And Positions
-- Tree-sitter positions use byte columns.
-- LSP positions use UTF-16 columns.
+- Tree-sitter positions use LF-only rows and byte columns.
+- LSP positions use LF/CRLF/bare-CR lines and UTF-16 columns; LS/PS/NEL/VT/FF are ordinary content.
+- Convert the complete row/column pair through `php_lsp_parser::line_index::LineIndex` (`Utf16LineIndex` alias); do not reuse LSP rows in CST queries or convert columns alone. Reuse the index for batches, preserve source bytes and do not reconvert stored LSP ranges.
 - `SymbolInfo.range`, `SymbolInfo.selection_range`, and `UseStatement.range` are parser byte-column ranges unless a field comment explicitly says otherwise.
 - `SymbolReference.range` is already an LSP UTF-16 range.
 - Before returning byte-backed ranges to LSP, convert with `php_lsp_parser::utf16::range_byte_to_utf16` or `Utf16LineIndex`.

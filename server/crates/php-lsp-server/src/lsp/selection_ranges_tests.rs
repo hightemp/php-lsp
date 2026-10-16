@@ -52,10 +52,16 @@ fn p239_template_selection_boundaries_repeated_projections_and_generated_prelude
 
 #[test]
 fn p239_selection_keeps_one_parser_template_snapshot_during_edit_and_reopen() {
-    for reopen in [false, true] {
+    for (reopen, ending) in [false, true]
+        .into_iter()
+        .flat_map(|reopen| ["\n", "\r\n", "\r"].map(|ending| (reopen, ending)))
+    {
         let uri = "file:///p239/race.twig";
-        let before = preprocess_twig_template("{{ first.name }}\n", &[]);
-        let after = preprocess_twig_template("plain text\n{{ second.email }}\n", &[]);
+        let before = preprocess_twig_template(&format!("{{{{ first.name }}}}{ending}"), &[]);
+        let after = preprocess_twig_template(
+            &format!("plain text{ending}{{{{ second.email }}}}{ending}"),
+            &[],
+        );
         let positions = [Position::new(0, 5), Position::new(1, 0)];
         let open = Arc::new(DashMap::new());
         let templates = Arc::new(DashMap::new());
@@ -124,6 +130,59 @@ fn p239_selection_keeps_one_parser_template_snapshot_during_edit_and_reopen() {
             &new,
         );
     }
+}
+
+#[test]
+fn line_model_selection_reader_serializes_two_cr_edits_with_the_parser_snapshot() {
+    let uri = "file:///line-model-race.php";
+    let before = "<?php\rfunction first() {}\r";
+    let after = "<?php\r// changed\rfunction other() {}\r";
+    let open = Arc::new(DashMap::new());
+    let templates = Arc::new(DashMap::new());
+    open.insert(uri.into(), parser(before));
+    let positions = [Position::new(1, 10)];
+    let expected = selection_ranges_for_open_document(&open, &templates, uri, &positions, || {})
+        .unwrap()
+        .unwrap();
+    let (entered, wait) = std::sync::mpsc::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    let reader_open = open.clone();
+    let reader_templates = templates.clone();
+    let reader = std::thread::spawn(move || {
+        selection_ranges_for_open_document(&reader_open, &reader_templates, uri, &positions, || {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+        })
+        .unwrap()
+        .unwrap()
+    });
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        open.try_get_mut(uri),
+        dashmap::try_result::TryResult::Locked
+    ));
+    let writer_open = open.clone();
+    let (started, waiting) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let mut parser = writer_open.get_mut(uri).unwrap();
+        parser.apply_edit(1, 0, 1, 0, "// changed\r").unwrap();
+        parser.apply_edit(2, 9, 2, 14, "other").unwrap();
+        assert_eq!(parser.source(), after);
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(reader.join().unwrap(), expected);
+    writer.join().unwrap();
+    let actual =
+        selection_ranges_for_open_document(&open, &templates, uri, &[Position::new(2, 10)], || {})
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        actual[0].range,
+        Range::new(Position::new(2, 9), Position::new(2, 14))
+    );
+    assert_chains(after, &[Position::new(2, 10)], &actual);
 }
 
 #[test]

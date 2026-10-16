@@ -613,3 +613,17 @@ fn twig_copied_expression_tokens_map_for_type_diagnostics() {
         range_for_byte_offsets(source, original_start, original_end)
     );
 }
+
+#[test]
+fn line_model_unterminated_template_string_ends_at_a_logical_line() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let source = format!("{{ path('unfinished{eol} next) }}");
+        let offset = source.find("unfinished").unwrap() + 2;
+        let bounds = template_string_literal_bounds_at_offset(&source, offset).unwrap();
+        assert_eq!(
+            &source[bounds.content_start..bounds.content_end],
+            "unfinished",
+            "{eol:?}"
+        );
+    }
+}

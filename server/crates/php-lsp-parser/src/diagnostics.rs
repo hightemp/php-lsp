@@ -42,16 +42,14 @@ fn collect_errors(
     if let Some(message) = tree_sitter_error_message(node) {
         let start = node.start_position();
         let end = node.end_position();
+        let (start_line, start_column) =
+            utf16_index.point_to_position(start.row as u32, start.column as u32);
+        let (end_line, end_column) =
+            utf16_index.point_to_position(end.row as u32, end.column as u32);
         diagnostics.push(Utf16SyntaxDiagnostic(Diagnostic {
             range: Range {
-                start: Position::new(
-                    start.row as u32,
-                    utf16_index.byte_col_to_utf16(start.row as u32, start.column as u32),
-                ),
-                end: Position::new(
-                    end.row as u32,
-                    utf16_index.byte_col_to_utf16(end.row as u32, end.column as u32),
-                ),
+                start: Position::new(start_line, start_column),
+                end: Position::new(end_line, end_column),
             },
             severity: Some(DiagnosticSeverity::ERROR),
             code: Some(NumberOrString::String(SYNTAX_ERROR_CODE.into())),

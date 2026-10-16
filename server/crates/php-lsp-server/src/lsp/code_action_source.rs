@@ -141,6 +141,9 @@ pub(super) fn analyzer_ignore_edit(
     diagnostic: &Diagnostic,
     analyzer: ExternalAnalyzer,
 ) -> Option<WorkspaceEdit> {
+    if !external_analyzer_edits_supported(source) {
+        return None;
+    }
     let (start, end) = diagnostic_range_byte_offsets(source, diagnostic.range)?;
     if start > end {
         return None;
@@ -241,10 +244,13 @@ pub(super) fn organizable_block_is_safe(
     start_line: u32,
     end_line: u32,
 ) -> bool {
-    let Some(start) = byte_offset_for_line_col(source, start_line, 0) else {
+    let positions = Utf16LineIndex::new(source);
+    let Some(start) = positions.position_to_offset(start_line, 0) else {
         return false;
     };
-    let end = byte_offset_for_line_col(source, end_line, 0).unwrap_or(source.len());
+    let end = positions
+        .position_to_offset(end_line, 0)
+        .unwrap_or(source.len());
     let mut declarations = Vec::new();
     for import in &file.use_statements {
         let Some((a, b)) = byte_offsets_for_range(source, import.range) else {

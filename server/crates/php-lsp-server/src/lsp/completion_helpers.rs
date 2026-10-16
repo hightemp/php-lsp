@@ -785,7 +785,7 @@ pub(in crate::server) fn find_unescaped_quote(
             escaped = true;
         } else if ch == quote {
             return Some(start + relative);
-        } else if ch == '\n' {
+        } else if matches!(ch, '\r' | '\n') {
             return None;
         }
     }

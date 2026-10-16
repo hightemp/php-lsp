@@ -26,6 +26,7 @@ phpstorm-stubs support.
 ### Language Intelligence
 
 - Syntax diagnostics with incremental tree-sitter parsing and UTF-16 ranges.
+  Incremental edits preserve LF/CRLF/CR and Unicode separators without normalizing source text.
 - Semantic diagnostics for unknown classes, functions, imports, members, and
   duplicate top-level or class-member declarations.
 - Undefined-variable diagnostics follow reachable branches, guards and loops,
@@ -238,7 +239,8 @@ phpstorm-stubs support.
   instanceof guard binding (schema 34), exact shape-key binding (schema 35),
   bounded foreach/receiver inference (schema 36), or shared foreach bindings and
   callable budget reservations (schema 37), or framework/builtin function
-  identity and nullable call results (current schema 38).
+  identity and nullable call results (schema 38), or corrected document line
+  coordinates and bindings (current schema 39).
   A smaller real-project regression profile (schema 37; 2026-10-12) completed
   4160 files on one CPU, reaching ready in 26.05s cold and 2.06s warm with full
   cache hits; see

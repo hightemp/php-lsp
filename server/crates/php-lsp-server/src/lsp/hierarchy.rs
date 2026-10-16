@@ -1,11 +1,11 @@
 //! Hierarchy LSP handlers extracted from `server.rs`.
 
-use crate::util::lsp_text::range_from_byte_range;
-
 use super::super::*;
 
 #[path = "call_hierarchy_graph.rs"]
 mod call_graph;
+
+type HierarchyPositions = HashMap<String, Option<Arc<Utf16LineIndex>>>;
 
 type CallableSourceRange = (u32, u32, u32, u32);
 type GroupedCallRanges = (Arc<php_lsp_types::SymbolInfo>, Vec<Range>);
@@ -26,7 +26,7 @@ fn is_call_hierarchy_ref_kind(ref_kind: RefKind) -> bool {
 
 fn call_hierarchy_item_from_symbol(
     sym: &php_lsp_types::SymbolInfo,
-    source: &str,
+    positions: &Utf16LineIndex,
     workspace_uri: &str,
 ) -> Option<CallHierarchyItem> {
     let uri = sym.uri.parse::<Uri>().ok()?;
@@ -39,8 +39,8 @@ fn call_hierarchy_item_from_symbol(
             .then_some(vec![SymbolTag::DEPRECATED]),
         detail: Some(call_hierarchy_detail(sym)),
         uri,
-        range: range_from_byte_range(source, sym.range),
-        selection_range: range_from_byte_range(source, sym.selection_range),
+        range: range_from_lsp_tuple(positions.range_to_lsp(sym.range)),
+        selection_range: range_from_lsp_tuple(positions.range_to_lsp(sym.selection_range)),
         data: Some(serde_json::json!({
             "fqn": sym.fqn,
             "kind": call_hierarchy_kind_key(sym.kind),
@@ -112,7 +112,7 @@ fn is_type_hierarchy_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
 
 fn type_hierarchy_item_from_symbol(
     sym: &php_lsp_types::SymbolInfo,
-    source: &str,
+    positions: &Utf16LineIndex,
     workspace_uri: &str,
 ) -> Option<TypeHierarchyItem> {
     if !is_type_hierarchy_symbol_kind(sym.kind) {
@@ -125,8 +125,8 @@ fn type_hierarchy_item_from_symbol(
         tags: sym.modifiers.is_deprecated.then_some(SymbolTag::DEPRECATED),
         detail: Some(sym.fqn.clone()),
         uri,
-        range: range_from_byte_range(source, sym.range),
-        selection_range: range_from_byte_range(source, sym.selection_range),
+        range: range_from_lsp_tuple(positions.range_to_lsp(sym.range)),
+        selection_range: range_from_lsp_tuple(positions.range_to_lsp(sym.selection_range)),
         data: Some(serde_json::json!({
             "fqn": sym.fqn,
             "kind": call_hierarchy_kind_key(sym.kind),
@@ -162,20 +162,7 @@ async fn type_hierarchy_symbol_from_item(
             }
         }
 
-        let selection = (
-            item.selection_range.start.line,
-            utf16_col_to_byte(
-                &source,
-                item.selection_range.start.line,
-                item.selection_range.start.character,
-            ),
-            item.selection_range.end.line,
-            utf16_col_to_byte(
-                &source,
-                item.selection_range.end.line,
-                item.selection_range.end.character,
-            ),
-        );
+        let selection = lsp_range_to_byte_range(&source, item.selection_range);
         return file_symbols
             .symbols
             .iter()
@@ -201,20 +188,7 @@ async fn type_hierarchy_symbol_from_item(
     let source = backend
         .source_for_uri_in_request(request, uri, "typeHierarchy item source read")
         .await?;
-    let selection = (
-        item.selection_range.start.line,
-        utf16_col_to_byte(
-            &source,
-            item.selection_range.start.line,
-            item.selection_range.start.character,
-        ),
-        item.selection_range.end.line,
-        utf16_col_to_byte(
-            &source,
-            item.selection_range.end.line,
-            item.selection_range.end.character,
-        ),
-    );
+    let selection = lsp_range_to_byte_range(&source, item.selection_range);
     index
         .read()
         .file_symbols()
@@ -388,20 +362,7 @@ async fn call_hierarchy_symbol_from_item(
             }
         }
 
-        let selection = (
-            item.selection_range.start.line,
-            utf16_col_to_byte(
-                &source,
-                item.selection_range.start.line,
-                item.selection_range.start.character,
-            ),
-            item.selection_range.end.line,
-            utf16_col_to_byte(
-                &source,
-                item.selection_range.end.line,
-                item.selection_range.end.character,
-            ),
-        );
+        let selection = lsp_range_to_byte_range(&source, item.selection_range);
         return file_symbols
             .symbols
             .iter()
@@ -425,20 +386,7 @@ async fn call_hierarchy_symbol_from_item(
     let source = backend
         .source_for_uri_in_request(request, uri, "callHierarchy item source read")
         .await?;
-    let selection = (
-        item.selection_range.start.line,
-        utf16_col_to_byte(
-            &source,
-            item.selection_range.start.line,
-            item.selection_range.start.character,
-        ),
-        item.selection_range.end.line,
-        utf16_col_to_byte(
-            &source,
-            item.selection_range.end.line,
-            item.selection_range.end.character,
-        ),
-    );
+    let selection = lsp_range_to_byte_range(&source, item.selection_range);
     index
         .read()
         .file_symbols()
@@ -481,17 +429,36 @@ fn hierarchy_workspace_uri<'a>(data: Option<&'a serde_json::Value>, fallback: &'
 }
 
 impl PhpLspBackend {
+    async fn hierarchy_positions(
+        &self,
+        request: &WorkspaceRequestContext,
+        uri: &str,
+        label: &'static str,
+        cache: &mut HierarchyPositions,
+    ) -> Option<Arc<Utf16LineIndex>> {
+        if let Some(positions) = cache.get(uri) {
+            return positions.clone();
+        }
+        let positions = self
+            .source_for_uri_in_request(request, uri, label)
+            .await
+            .map(|source| Arc::new(hierarchy_position_index(&source)));
+        cache.insert(uri.to_string(), positions.clone());
+        positions
+    }
+
     pub(in crate::server) async fn call_hierarchy_item_for_symbol(
         &self,
         request: &WorkspaceRequestContext,
         workspace_uri: &str,
         symbol: &php_lsp_types::SymbolInfo,
         label: &'static str,
+        cache: &mut HierarchyPositions,
     ) -> Option<CallHierarchyItem> {
-        let source = self
-            .source_for_uri_in_request(request, &symbol.uri, label)
+        let positions = self
+            .hierarchy_positions(request, &symbol.uri, label, cache)
             .await?;
-        call_hierarchy_item_from_symbol(symbol, &source, workspace_uri)
+        call_hierarchy_item_from_symbol(symbol, &positions, workspace_uri)
     }
 
     pub(in crate::server) async fn type_hierarchy_item_for_symbol(
@@ -500,11 +467,12 @@ impl PhpLspBackend {
         workspace_uri: &str,
         symbol: &php_lsp_types::SymbolInfo,
         label: &'static str,
+        cache: &mut HierarchyPositions,
     ) -> Option<TypeHierarchyItem> {
-        let source = self
-            .source_for_uri_in_request(request, &symbol.uri, label)
+        let positions = self
+            .hierarchy_positions(request, &symbol.uri, label, cache)
             .await?;
-        type_hierarchy_item_from_symbol(symbol, &source, workspace_uri)
+        type_hierarchy_item_from_symbol(symbol, &positions, workspace_uri)
     }
 
     pub(crate) async fn lsp_prepare_call_hierarchy(
@@ -519,6 +487,7 @@ impl PhpLspBackend {
             .to_string();
         let request = self.request_context_for_uri(&uri_str).await;
         let request_index = request.index(&self.index);
+        let mut positions_cache = HierarchyPositions::new();
         let pos = params.text_document_position_params.position;
 
         let Some(OpenDocumentSnapshot {
@@ -532,7 +501,8 @@ impl PhpLspBackend {
         };
         let (candidate, local_candidate, containing_candidate, allow_containing_fallback) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let (byte_line, byte_col) =
+                lsp_position_to_byte_point(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
@@ -542,7 +512,7 @@ impl PhpLspBackend {
             let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -565,7 +535,7 @@ impl PhpLspBackend {
             // Symbol ranges alone span nested anonymous/unrepresented callables.
             // Use the nearest lexical scope from this same document snapshot,
             // then require its exact named declaration in the symbol table.
-            let point = tree_sitter::Point::new(pos.line as usize, byte_col as usize);
+            let point = tree_sitter::Point::new(byte_line as usize, byte_col as usize);
             let containing_candidate = tree
                 .root_node()
                 .descendant_for_point_range(point, point)
@@ -645,13 +615,14 @@ impl PhpLspBackend {
         }
 
         let item = if symbol.uri == uri_str {
-            call_hierarchy_item_from_symbol(&symbol, &source, &uri_str)
+            call_hierarchy_item_from_symbol(&symbol, &hierarchy_position_index(&source), &uri_str)
         } else {
             self.call_hierarchy_item_for_symbol(
                 &request,
                 &uri_str,
                 &symbol,
                 "callHierarchy/prepare source read",
+                &mut positions_cache,
             )
             .await
         };
@@ -666,6 +637,7 @@ impl PhpLspBackend {
             hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
         let request = self.request_context_for_uri(workspace_uri).await;
         let request_index = request.index(&self.index);
+        let mut positions_cache = HierarchyPositions::new();
         let Some((target, target_kind)) =
             call_hierarchy_target_from_item(self, &request, &request_index, &params.item).await
         else {
@@ -708,6 +680,7 @@ impl PhpLspBackend {
                     workspace_uri,
                     &caller,
                     "callHierarchy/incoming caller source read",
+                    &mut positions_cache,
                 )
                 .await
             {
@@ -740,6 +713,7 @@ impl PhpLspBackend {
             hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
         let request = self.request_context_for_uri(workspace_uri).await;
         let request_index = request.index(&self.index);
+        let mut positions_cache = HierarchyPositions::new();
         let Some((caller, _)) =
             call_hierarchy_target_from_item(self, &request, &request_index, &params.item).await
         else {
@@ -781,6 +755,7 @@ impl PhpLspBackend {
                     workspace_uri,
                     &target,
                     "callHierarchy/outgoing target source read",
+                    &mut positions_cache,
                 )
                 .await
             {
@@ -816,6 +791,7 @@ impl PhpLspBackend {
             .to_string();
         let request = self.request_context_for_uri(&uri_str).await;
         let request_index = request.index(&self.index);
+        let mut positions_cache = HierarchyPositions::new();
         let pos = params.text_document_position_params.position;
 
         let Some(OpenDocumentSnapshot {
@@ -829,7 +805,8 @@ impl PhpLspBackend {
         };
         let (candidate, local_candidate, containing_class_fqn, containing_class_candidate) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let (byte_line, byte_col) =
+                lsp_position_to_byte_point(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
@@ -839,7 +816,7 @@ impl PhpLspBackend {
             let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -861,7 +838,7 @@ impl PhpLspBackend {
                     .find(|sym| sym.fqn == *fqn && is_type_hierarchy_symbol_kind(sym.kind))
                     .cloned()
             });
-            let point_range = (pos.line, byte_col, pos.line, byte_col);
+            let point_range = (byte_line, byte_col, byte_line, byte_col);
             let containing_class_fqn = current_class_fqn_at_range(&file_symbols, point_range);
             let containing_class_candidate = containing_class_fqn.as_ref().and_then(|fqn| {
                 file_symbols
@@ -919,13 +896,14 @@ impl PhpLspBackend {
         };
 
         let item = if symbol.uri == uri_str {
-            type_hierarchy_item_from_symbol(&symbol, &source, &uri_str)
+            type_hierarchy_item_from_symbol(&symbol, &hierarchy_position_index(&source), &uri_str)
         } else {
             self.type_hierarchy_item_for_symbol(
                 &request,
                 &uri_str,
                 &symbol,
                 "typeHierarchy/prepare source read",
+                &mut positions_cache,
             )
             .await
         };
@@ -940,6 +918,7 @@ impl PhpLspBackend {
             hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
         let request = self.request_context_for_uri(workspace_uri).await;
         let request_index = request.index(&self.index);
+        let mut positions_cache = HierarchyPositions::new();
         let Some(symbol) =
             type_hierarchy_symbol_from_item(self, &request, &request_index, &params.item).await
         else {
@@ -966,6 +945,7 @@ impl PhpLspBackend {
                         workspace_uri,
                         &parent,
                         "typeHierarchy/supertypes source read",
+                        &mut positions_cache,
                     )
                     .await
                 {
@@ -990,6 +970,7 @@ impl PhpLspBackend {
             hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
         let request = self.request_context_for_uri(workspace_uri).await;
         let request_index = request.index(&self.index);
+        let mut positions_cache = HierarchyPositions::new();
         let Some(symbol) =
             type_hierarchy_symbol_from_item(self, &request, &request_index, &params.item).await
         else {
@@ -1004,6 +985,7 @@ impl PhpLspBackend {
                     workspace_uri,
                     &symbol,
                     "typeHierarchy/subtypes source read",
+                    &mut positions_cache,
                 )
                 .await
             {
@@ -1018,3 +1000,15 @@ impl PhpLspBackend {
         }
     }
 }
+
+#[cfg(test)]
+thread_local! {static POSITION_INDEX_BUILDS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};}
+fn hierarchy_position_index(source: &str) -> Utf16LineIndex {
+    #[cfg(test)]
+    POSITION_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
+    Utf16LineIndex::new(source)
+}
+
+#[cfg(test)]
+#[path = "hierarchy_position_tests.rs"]
+mod position_tests;

@@ -22,7 +22,8 @@ use crate::template::{
 };
 use crate::util::fs_walk::TraversalLimits;
 use crate::util::lsp_text::{
-    lsp_position_to_byte, range_from_byte_range, range_from_lsp_tuple, text_at_lsp_range,
+    lsp_position_to_byte, position_from_byte_point, position_from_offset, range_from_byte_range,
+    range_from_lsp_tuple, text_at_lsp_range,
 };
 use crate::util::uri::uri_to_path;
 use dashmap::DashMap;
@@ -59,7 +60,7 @@ use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::{
     extract_file_symbols, extract_file_symbols_for_php_version, PhpSymbolExtractionVersion,
 };
-use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
+use php_lsp_parser::utf16::{lsp_position_to_byte_point, range_byte_to_utf16, Utf16LineIndex};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};

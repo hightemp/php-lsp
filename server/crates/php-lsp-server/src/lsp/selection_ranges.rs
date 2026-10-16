@@ -1,60 +1,32 @@
 //! Ordered selection chains built from one coherent original/virtual document.
 use super::*;
-use php_lsp_parser::utf16::{utf16_col_to_byte_in_line, Utf16LineIndex};
+use php_lsp_parser::utf16::Utf16LineIndex;
 
 // SelectionRange serializes and drops recursively. Keep the closest useful
 // ranges within a bounded response depth; LSP does not require every ancestor.
 const MAX_SELECTION_RANGES: usize = 64;
 
-struct SourcePositions<'a> {
-    lines: Vec<&'a str>,
-    starts: Vec<usize>,
-    utf16: Utf16LineIndex,
+struct SourcePositions {
+    index: Utf16LineIndex,
 }
-impl<'a> SourcePositions<'a> {
-    fn new(source: &'a str) -> Self {
-        let mut offset = 0;
-        let mut starts = Vec::new();
-        let lines = source
-            .split('\n')
-            .map(|line| {
-                starts.push(offset);
-                offset += line.len() + 1;
-                line.strip_suffix('\r').unwrap_or(line)
-            })
-            .collect();
+impl SourcePositions {
+    fn new(source: &str) -> Self {
         Self {
-            lines,
-            starts,
-            utf16: Utf16LineIndex::new(source),
+            index: Utf16LineIndex::new(source),
         }
     }
     fn normalize(&self, position: Position) -> Option<(Position, usize)> {
-        let line = *self.lines.get(position.line as usize)?;
-        let byte = utf16_col_to_byte_in_line(line, position.character);
-        Some((
-            Position::new(
-                position.line,
-                self.utf16.byte_col_to_utf16(position.line, byte),
-            ),
-            self.starts[position.line as usize] + byte as usize,
-        ))
+        let offset = self
+            .index
+            .position_to_offset(position.line, position.character)?;
+        Some((position_from_offset(&self.index, offset), offset))
     }
     fn point(&self, offset: usize) -> tree_sitter::Point {
-        let row = self
-            .starts
-            .partition_point(|start| *start <= offset)
-            .saturating_sub(1);
-        tree_sitter::Point::new(row, offset - self.starts[row])
+        let (row, column) = self.index.offset_to_point(offset);
+        tree_sitter::Point::new(row as usize, column as usize)
     }
     fn position(&self, offset: usize) -> Position {
-        let point = self.point(offset);
-        let column = point.column.min(self.lines[point.row].len());
-        Position::new(
-            point.row as u32,
-            self.utf16
-                .byte_col_to_utf16(point.row as u32, column as u32),
-        )
+        position_from_offset(&self.index, offset)
     }
     fn range(&self, start: usize, end: usize) -> Range {
         Range::new(self.position(start), self.position(end))

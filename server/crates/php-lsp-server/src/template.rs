@@ -1,5 +1,7 @@
-use php_lsp_parser::utf16::{utf16_col_to_byte, Utf16LineIndex};
+use crate::util::lsp_text::position_from_offset;
+use php_lsp_parser::utf16::Utf16LineIndex;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tower_lsp::ls_types::{
     Diagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range, SemanticToken, Uri,
 };
@@ -42,6 +44,8 @@ pub(crate) struct TemplateDocument {
     kind: TemplateKind,
     original_source: String,
     virtual_source: String,
+    original_positions: Arc<Utf16LineIndex>,
+    virtual_positions: Arc<Utf16LineIndex>,
     source_map: TemplateSourceMap,
     semantic_tokens: Vec<TemplateSemanticToken>,
     twig_variable_types: Vec<TemplateVariableType>,
@@ -98,10 +102,12 @@ impl TemplateDocument {
     }
 
     pub(crate) fn map_original_position_to_virtual(&self, position: Position) -> Option<Position> {
-        let original_offset = byte_offset_for_position(&self.original_source, position)?;
+        let original_offset = self
+            .original_positions
+            .position_to_offset(position.line, position.character)?;
         let virtual_offset = self.source_map.original_to_virtual(original_offset)?;
-        Some(position_for_byte_offset(
-            &self.virtual_source,
+        Some(position_from_offset(
+            &self.virtual_positions,
             virtual_offset,
         ))
     }
@@ -120,25 +126,31 @@ impl TemplateDocument {
     }
 
     pub(crate) fn map_virtual_range_to_original(&self, range: Range) -> Option<Range> {
-        let virtual_start = byte_offset_for_position(&self.virtual_source, range.start)?;
-        let virtual_end = byte_offset_for_position(&self.virtual_source, range.end)?;
+        let virtual_start = self
+            .virtual_positions
+            .position_to_offset(range.start.line, range.start.character)?;
+        let virtual_end = self
+            .virtual_positions
+            .position_to_offset(range.end.line, range.end.character)?;
         let (original_start, original_end) = self
             .source_map
             .virtual_range_to_original(virtual_start, virtual_end)?;
-        Some(range_for_byte_offsets(
-            &self.original_source,
+        Some(range_for_indexed_offsets(
+            &self.original_positions,
             original_start,
             original_end,
         ))
     }
 
     pub(crate) fn map_virtual_position_to_original(&self, position: Position) -> Option<Position> {
-        let virtual_offset = byte_offset_for_position(&self.virtual_source, position)?;
+        let virtual_offset = self
+            .virtual_positions
+            .position_to_offset(position.line, position.character)?;
         let (original_offset, _) = self
             .source_map
             .virtual_range_to_original(virtual_offset, virtual_offset)?;
-        Some(position_for_byte_offset(
-            &self.original_source,
+        Some(position_from_offset(
+            &self.original_positions,
             original_offset,
         ))
     }
@@ -179,13 +191,17 @@ impl TemplateDocument {
     }
 
     fn map_virtual_range_to_original_exact(&self, range: Range) -> Option<Range> {
-        let virtual_start = byte_offset_for_position(&self.virtual_source, range.start)?;
-        let virtual_end = byte_offset_for_position(&self.virtual_source, range.end)?;
+        let virtual_start = self
+            .virtual_positions
+            .position_to_offset(range.start.line, range.start.character)?;
+        let virtual_end = self
+            .virtual_positions
+            .position_to_offset(range.end.line, range.end.character)?;
         let (original_start, original_end) = self
             .source_map
             .virtual_range_to_original_exact(virtual_start, virtual_end)?;
-        Some(range_for_byte_offsets(
-            &self.original_source,
+        Some(range_for_indexed_offsets(
+            &self.original_positions,
             original_start,
             original_end,
         ))
@@ -220,10 +236,16 @@ impl TemplateDocument {
         for token in decode_semantic_tokens(&tokens) {
             let start = Position::new(token.line, token.start);
             let end = Position::new(token.line, token.start.saturating_add(token.length));
-            let Some(virtual_start) = byte_offset_for_position(&self.virtual_source, start) else {
+            let Some(virtual_start) = self
+                .virtual_positions
+                .position_to_offset(start.line, start.character)
+            else {
                 continue;
             };
-            let Some(virtual_end) = byte_offset_for_position(&self.virtual_source, end) else {
+            let Some(virtual_end) = self
+                .virtual_positions
+                .position_to_offset(end.line, end.character)
+            else {
                 continue;
             };
             let Some((original_start, original_end)) = self
@@ -233,7 +255,7 @@ impl TemplateDocument {
                 continue;
             };
             push_original_semantic_token(
-                &self.original_source,
+                &self.original_positions,
                 original_start,
                 original_end,
                 token.token_type,
@@ -244,7 +266,7 @@ impl TemplateDocument {
 
         for token in &self.semantic_tokens {
             push_original_semantic_token(
-                &self.original_source,
+                &self.original_positions,
                 token.original_start,
                 token.original_end,
                 token.token_type,
@@ -633,6 +655,8 @@ pub(crate) fn preprocess_blade_template(source: &str) -> TemplateDocument {
     TemplateDocument {
         kind: TemplateKind::Blade,
         original_source: source.to_string(),
+        original_positions: Arc::new(Utf16LineIndex::new(source)),
+        virtual_positions: Arc::new(Utf16LineIndex::new(&virtual_source)),
         virtual_source,
         source_map,
         semantic_tokens,
@@ -751,6 +775,8 @@ pub(crate) fn preprocess_twig_template(
     TemplateDocument {
         kind: TemplateKind::Twig,
         original_source: source.to_string(),
+        original_positions: Arc::new(Utf16LineIndex::new(source)),
+        virtual_positions: Arc::new(Utf16LineIndex::new(&virtual_source)),
         virtual_source,
         source_map,
         semantic_tokens,
@@ -2463,7 +2489,7 @@ fn template_string_literal_bounds_at_offset(
 
 fn line_end_offset(source: &str, offset: usize) -> usize {
     source[offset..]
-        .find('\n')
+        .find(['\r', '\n'])
         .map(|relative| offset + relative)
         .unwrap_or(source.len())
 }
@@ -2690,40 +2716,20 @@ pub(crate) fn apply_text_change(
 }
 
 fn byte_offset_for_position(source: &str, position: Position) -> Option<usize> {
-    let line_start = *line_start_offsets(source).get(position.line as usize)?;
-    let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
-    Some((line_start + byte_col).min(source.len()))
+    Utf16LineIndex::new(source).position_to_offset(position.line, position.character)
 }
-
+#[cfg(test)]
 fn position_for_byte_offset(source: &str, offset: usize) -> Position {
-    let offsets = line_start_offsets(source);
-    let line_idx = offsets
-        .partition_point(|line_start| *line_start <= offset)
-        .saturating_sub(1);
-    let line_start = offsets.get(line_idx).copied().unwrap_or(0);
-    let byte_col = offset.saturating_sub(line_start) as u32;
-    let utf16_index = Utf16LineIndex::new(source);
-    Position::new(
-        line_idx as u32,
-        utf16_index.byte_col_to_utf16(line_idx as u32, byte_col),
-    )
+    position_from_offset(&Utf16LineIndex::new(source), offset)
 }
-
 fn range_for_byte_offsets(source: &str, start: usize, end: usize) -> Range {
-    Range {
-        start: position_for_byte_offset(source, start),
-        end: position_for_byte_offset(source, end),
-    }
+    range_for_indexed_offsets(&Utf16LineIndex::new(source), start, end)
 }
-
-fn line_start_offsets(source: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
-    for (idx, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            offsets.push(idx + 1);
-        }
-    }
-    offsets
+fn range_for_indexed_offsets(index: &Utf16LineIndex, start: usize, end: usize) -> Range {
+    Range::new(
+        position_from_offset(index, start),
+        position_from_offset(index, end),
+    )
 }
 
 fn decode_semantic_tokens(tokens: &[SemanticToken]) -> Vec<AbsoluteSemanticToken> {
@@ -2798,56 +2804,24 @@ fn normalize_and_encode_semantic_tokens(
 }
 
 fn push_original_semantic_token(
-    source: &str,
+    index: &Utf16LineIndex,
     original_start: usize,
     original_end: usize,
     token_type: u32,
     token_modifiers_bitset: u32,
     tokens: &mut Vec<AbsoluteSemanticToken>,
 ) {
-    if original_end <= original_start {
-        return;
-    }
-    let start = position_for_byte_offset(source, original_start);
-    let end = position_for_byte_offset(source, original_end);
-    if start.line != end.line {
-        let line_offsets = line_start_offsets(source);
-        for line in start.line..=end.line {
-            let line_start = *line_offsets.get(line as usize).unwrap_or(&source.len());
-            let line_end = line_offsets
-                .get(line as usize + 1)
-                .copied()
-                .map(|next| next.saturating_sub(1))
-                .unwrap_or(source.len());
-            let segment_start = if line == start.line {
-                original_start
-            } else {
-                line_start
-            };
-            let segment_end = if line == end.line {
-                original_end
-            } else {
-                line_end
-            };
-            push_original_semantic_token(
-                source,
-                segment_start,
-                segment_end,
+    for (line, start, end) in index.segments(original_start, original_end) {
+        if end > start {
+            tokens.push(AbsoluteSemanticToken {
+                line,
+                start,
+                length: end - start,
                 token_type,
                 token_modifiers_bitset,
-                tokens,
-            );
+            });
         }
-        return;
     }
-
-    tokens.push(AbsoluteSemanticToken {
-        line: start.line,
-        start: start.character,
-        length: end.character.saturating_sub(start.character),
-        token_type,
-        token_modifiers_bitset,
-    });
 }
 
 fn semantic_token_overlaps_range(token: AbsoluteSemanticToken, range: Range) -> bool {

@@ -14,7 +14,7 @@
 
 | # | Приоритет | Проблема | Статус |
 |---|---|---|---|
-| 1 | **P0** | Рассинхронизация документа: `ropey` считает U+2028/U+2029/U+0085/VT/FF переводами строк, а LSP и tree-sitter — нет | воспроизведено |
+| 1 | **P0** | Рассинхронизация документа: `ropey` считает U+2028/U+2029/U+0085/VT/FF переводами строк, а LSP и tree-sitter — нет | выполнено (2026-10-15), см. п. 1 |
 | 2 | **P0** | Вся CPU-работа обработчиков выполняется в одной задаче-диспетчере tower-lsp — тяжёлый запрос блокирует весь сервер | по коду |
 | 3 | **P1** | На каждое нажатие клавиши: 2× извлечение символов + 2× сбор ссылок + 2× запись в индекс синхронно, потом полный репарс в диагностике | по коду |
 | 4 | **P1** | Горячий путь индекса: каждый lookup глубоко клонирует `FileSymbols` и заново парсит PHPDoc класса | по коду |
@@ -54,6 +54,14 @@
 - `ropey = { version = "1", default-features = false, features = ["simd"] }` (без `unicode_lines`; `cr_lines` — по решению, см. ниже).
 - Точки tree-sitter (`Point.row`) вычислять так же, как tree-sitter — только по `\n`. Сейчас `start_point.row` берётся из строки rope. Одиночный `\r` LSP тоже считает переводом строки, а tree-sitter — нет, поэтому нужно одно правило преобразования позиций на весь сервер (желательно отдельный модуль `LineIndex`, построенный по правилам LSP и используемый всеми).
 - Добавить регрессионные тесты с U+2028, FF, одиночным `\r` во всех трёх местах: `apply_edit`, `utf16_col_to_byte`, `Utf16LineIndex`.
+
+**Статус: выполнено (2026-10-15).** Исходное описание находки выше сохранено.
+
+- **Исправлено:** общий `php-lsp-parser/src/line_index.rs` переводит полные пары строка/столбец между LSP (LF/CRLF/CR, UTF-16), байтовыми смещениями и Tree-sitter (только LF, байты). `FileParser` хранит индекс вместе с текстом/деревом; `InputEdit` считает только LF. У Ropey отключён `unicode_lines`, сохранён `cr_lines`; исходные байты не нормализуются. Входные запросы и исходящие диапазоны переведены на общий механизм, уже готовые LSP-диапазоны не конвертируются повторно. Шаблоны разделяют неизменяемые индексы original/virtual source; пакетные преобразования переиспользуют индекс. Старый кеш пересоздаётся по schema 39.
+- **TDD:** 34 новых теста; сначала зафиксирован RED на рассинхронизации текста/CST и протокольных диапазонах, затем на найденных при review PHPDoc/refactor/lexical случаях и повторных построениях индекса. Проверяются все пять Unicode-разделителей, LF/CRLF/CR и смешанные окончания, emoji/границы UTF-16/EOF, последовательные и пакетные правки, close/reopen, навигация/rename/диагностика/completion/signature/inlay/иерархии/символы/lenses/tokens/folding/selection и шаблоны. Управляемые барьеры проверяют согласованность reader/edit/edit и template edit/reopen; кеш проверен на миграцию и повторную загрузку. Счётчики требуют одно построение индекса на каждое извлечение symbols/references/tokens из 1000 объявлений и на файл в выдаче 100 callers/subtypes, без построения UTF-16 карты для уже известных CST-координат вывода типов.
+- **Проверки:** окончательный `cargo test --all` — 2004 PASS / 0 FAIL / 0 ignored; Clippy `--all-targets -- -D warnings`, Rustfmt и `git diff --check` — PASS. Все Rust-проверки последовательные (`CARGO_BUILD_JOBS=1`, `--test-threads=1`), с одним CPU и ограничением памяти. Повторный read-only Verifier (`gpt-6-astra`) — GO. Артефакты RED/GREEN и хеши проверенных исходников: `server/target/document-lines-2026-10-15/` (ignored).
+- **Граница:** для файлов с одиночным CR отключены редактирующие quick fix внешних PHPStan/Psalm, включая legacy replacement/ignore: их соглашения о строках ещё не имеют проверенного адаптера. Внешняя диагностика продолжает публиковаться, но её CR-диапазоны не гарантированы. Встроенные функции и обычные LF/CRLF analyzer actions сохранены. Проверки выполнялись на Linux; это конечный набор сценариев/порядков событий, не доказательство отсутствия всех гонок. Большой performance baseline и проценты покрытия не перемерялись.
+- **Документация:** актуализированы Position Model и правила AGENTS, feature/test-evidence matrices, описание analyzer quick fixes и текущей версии кеша. Регрессии: [`document_line_tests.rs`](../server/crates/php-lsp-parser/src/document_line_tests.rs), [`line_index_tests.rs`](../server/crates/php-lsp-parser/src/line_index_tests.rs), [`e2e_document_lines.rs`](../server/crates/php-lsp-server/tests/e2e_document_lines.rs), [`selection_ranges_tests.rs`](../server/crates/php-lsp-server/src/lsp/selection_ranges_tests.rs), [`hierarchy_position_tests.rs`](../server/crates/php-lsp-server/src/lsp/hierarchy_position_tests.rs).
 
 ### 2. Обработчики блокируют диспетчер tower-lsp
 

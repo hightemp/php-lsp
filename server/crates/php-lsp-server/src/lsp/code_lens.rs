@@ -368,9 +368,9 @@ impl Input {
                     .then(a.range.end.cmp(&b.range.end))
             });
             let r = symbol.selection_range;
-            let start = Position::new(r.0, position_index.byte_col_to_utf16(r.0, r.1));
+            let start = position_from_byte_point(&position_index, r.0, r.1);
             let end = if r.0 == r.2 {
-                Position::new(r.2, position_index.byte_col_to_utf16(r.2, r.3))
+                position_from_byte_point(&position_index, r.2, r.3)
             } else {
                 start
             };

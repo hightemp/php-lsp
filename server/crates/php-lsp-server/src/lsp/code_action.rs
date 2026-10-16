@@ -326,29 +326,32 @@ pub(crate) fn existing_import_for_fqn<'a>(
 }
 
 pub(crate) fn line_is_blank(source: &str, line: u32) -> bool {
-    source
-        .lines()
+    php_lsp_parser::line_index::logical_lines(source)
         .nth(line as usize)
         .map(|line| line.trim().is_empty())
         .unwrap_or(false)
 }
 
 pub(crate) fn find_use_insert_line(source: &str, file_symbols: &php_lsp_types::FileSymbols) -> u32 {
+    let positions = Utf16LineIndex::new(source);
     if let Some(last_use_line) = file_symbols
         .use_statements
         .iter()
-        .map(|use_stmt| use_stmt.range.2)
+        .map(|use_stmt| {
+            positions
+                .point_to_position(use_stmt.range.2, use_stmt.range.3)
+                .0
+        })
         .max()
     {
         return last_use_line + 1;
     }
 
     if let Some(scope) = file_symbols.namespace_scopes.first() {
-        let start_line = scope.range.0 as usize;
-        let end_line = scope.range.2 as usize;
+        let start_line = positions.point_to_position(scope.range.0, scope.range.1).0 as usize;
+        let end_line = positions.point_to_position(scope.range.2, scope.range.3).0 as usize;
         let mut namespace_declaration = false;
-        for (idx, line) in source
-            .lines()
+        for (idx, line) in php_lsp_parser::line_index::logical_lines(source)
             .enumerate()
             .skip(start_line)
             .take(end_line.saturating_sub(start_line) + 1)
@@ -367,15 +370,14 @@ pub(crate) fn find_use_insert_line(source: &str, file_symbols: &php_lsp_types::F
         }
     }
 
-    for (idx, line) in source.lines().enumerate() {
+    for (idx, line) in php_lsp_parser::line_index::logical_lines(source).enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("namespace ") && (trimmed.contains(';') || trimmed.contains('{')) {
             return idx as u32 + 1;
         }
     }
 
-    if source
-        .lines()
+    if php_lsp_parser::line_index::logical_lines(source)
         .next()
         .is_some_and(|line| line.trim() == "<?php")
     {
@@ -419,7 +421,7 @@ pub(crate) fn import_kind_sort_key(kind: ImportKind) -> u8 {
 }
 
 pub(crate) fn source_line(source: &str, line: u32) -> Option<&str> {
-    source.lines().nth(line as usize)
+    php_lsp_parser::line_index::logical_lines(source).nth(line as usize)
 }
 
 pub(crate) fn is_simple_use_statement_line(line: &str) -> bool {
@@ -434,23 +436,33 @@ pub(crate) fn find_organizable_use_block(
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
 ) -> Option<(u32, u32)> {
+    let positions = Utf16LineIndex::new(source);
     let start_line = file_symbols
         .use_statements
         .iter()
-        .map(|use_stmt| use_stmt.range.0)
+        .map(|use_stmt| {
+            positions
+                .point_to_position(use_stmt.range.0, use_stmt.range.1)
+                .0
+        })
         .min()?;
     let end_line = file_symbols
         .use_statements
         .iter()
-        .map(|use_stmt| use_stmt.range.2)
+        .map(|use_stmt| {
+            positions
+                .point_to_position(use_stmt.range.2, use_stmt.range.3)
+                .0
+        })
         .max()?
         + 1;
 
     for use_stmt in &file_symbols.use_statements {
-        if use_stmt.range.0 != use_stmt.range.2 {
+        let range = positions.range_to_lsp(use_stmt.range);
+        if range.0 != range.2 {
             return None;
         }
-        let line = source_line(source, use_stmt.range.0)?;
+        let line = source_line(source, range.0)?;
         if !is_simple_use_statement_line(line) {
             return None;
         }
@@ -489,9 +501,9 @@ fn import_is_used_by_references(
     references: &[php_lsp_types::SymbolReference],
     source: &str,
 ) -> bool {
+    let positions = Utf16LineIndex::new(source);
     references.iter().any(|reference| {
-        let line = reference.range.0;
-        let byte_column = php_lsp_parser::utf16::utf16_col_to_byte(source, line, reference.range.1);
+        let (line, byte_column) = positions.position_to_point(reference.range.0, reference.range.1);
         import_scope_contains(import, line, byte_column)
             && reference_matches_import(reference, import)
     })
@@ -816,12 +828,12 @@ pub(crate) fn build_organize_imports_edit(
 }
 
 pub(crate) fn lsp_range_to_byte_range(source: &str, range: Range) -> (u32, u32, u32, u32) {
-    (
+    Utf16LineIndex::new(source).range_to_points((
         range.start.line,
-        utf16_col_to_byte(source, range.start.line, range.start.character),
+        range.start.character,
         range.end.line,
-        utf16_col_to_byte(source, range.end.line, range.end.character),
-    )
+        range.end.character,
+    ))
 }
 
 pub(crate) fn simple_return_type_hint_is_supported(
@@ -1081,9 +1093,10 @@ pub(crate) fn add_return_type_edit(
     insert_position: CodeActionInsertPosition,
 ) -> WorkspaceEdit {
     let utf16_index = Utf16LineIndex::new(source);
-    let position = Position::new(
+    let position = position_from_byte_point(
+        &utf16_index,
         insert_position.line,
-        utf16_index.byte_col_to_utf16(insert_position.line, insert_position.byte_character),
+        insert_position.byte_character,
     );
 
     let mut changes = HashMap::new();
@@ -1965,7 +1978,9 @@ pub(crate) fn class_closing_brace_position(
 }
 
 pub(crate) fn line_text(source: &str, line: u32) -> &str {
-    source.lines().nth(line as usize).unwrap_or("")
+    php_lsp_parser::line_index::logical_lines(source)
+        .nth(line as usize)
+        .unwrap_or("")
 }
 
 pub(crate) fn line_prefix_by_byte_col(line_text: &str, byte_col: u32) -> &str {
@@ -1992,7 +2007,7 @@ pub(crate) fn method_insertion_needs_leading_blank(
         return true;
     }
 
-    let lines = source.lines().collect::<Vec<_>>();
+    let lines = php_lsp_parser::line_index::logical_lines(source).collect::<Vec<_>>();
     for line in lines
         .get(..closing_line as usize)
         .unwrap_or(&[])
@@ -2022,12 +2037,13 @@ pub(crate) fn class_method_insertion(
 ) -> Option<ClassMethodInsertion> {
     let (closing_line, closing_col) = class_closing_brace_position(source, class_sym)?;
     let utf16_index = Utf16LineIndex::new(source);
-    let position = Position::new(
-        closing_line,
-        utf16_index.byte_col_to_utf16(closing_line, closing_col),
-    );
-    let close_line = line_text(source, closing_line);
-    let close_indent = leading_ascii_whitespace(line_prefix_by_byte_col(close_line, closing_col));
+    let position = position_from_byte_point(&utf16_index, closing_line, closing_col);
+    let closing_offset = utf16_index.point_to_offset(closing_line, closing_col)?;
+    let logical_line = utf16_index.offset_to_position(closing_offset).0;
+    let logical_column = (closing_offset - utf16_index.line_range(logical_line)?.start) as u32;
+    let close_line = line_text(source, logical_line);
+    let close_indent =
+        leading_ascii_whitespace(line_prefix_by_byte_col(close_line, logical_column));
     let method_indent = format!("{}    ", close_indent);
     let body_indent = format!("{}    ", method_indent);
 
@@ -2037,8 +2053,8 @@ pub(crate) fn class_method_insertion(
         body_indent,
         needs_leading_blank: method_insertion_needs_leading_blank(
             source,
-            closing_line,
-            closing_col,
+            logical_line,
+            logical_column,
         ),
     })
 }
@@ -2812,19 +2828,11 @@ pub(crate) fn generate_accessor_edit(
 }
 
 pub(crate) fn lsp_range_for_byte_offsets(source: &str, start: usize, end: usize) -> Range {
-    let (start_line, start_byte_col) = line_col_for_byte_offset(source, start);
-    let (end_line, end_byte_col) = line_col_for_byte_offset(source, end);
-    let utf16_index = Utf16LineIndex::new(source);
-    Range {
-        start: Position::new(
-            start_line,
-            utf16_index.byte_col_to_utf16(start_line, start_byte_col),
-        ),
-        end: Position::new(
-            end_line,
-            utf16_index.byte_col_to_utf16(end_line, end_byte_col),
-        ),
-    }
+    let index = Utf16LineIndex::new(source);
+    Range::new(
+        position_from_offset(&index, start),
+        position_from_offset(&index, end),
+    )
 }
 
 pub(crate) fn is_ident_byte(byte: u8) -> bool {
@@ -2883,12 +2891,15 @@ pub(crate) fn change_visibility_edit(
 }
 
 pub(crate) fn line_full_span(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-    let line_end = source[end..]
-        .find('\n')
-        .map(|idx| end + idx + 1)
-        .unwrap_or(source.len());
-    (line_start, line_end)
+    let start = line_start_offset(source, start);
+    let mut end = line_end_offset(source, end);
+    if source.as_bytes().get(end) == Some(&b'\r') {
+        end += 1;
+    }
+    if source.as_bytes().get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    (start, end)
 }
 
 pub(crate) fn find_matching_delimiter(
@@ -3095,23 +3106,16 @@ pub(crate) fn property_promotion_prefix(property: &php_lsp_types::SymbolInfo) ->
 }
 
 pub(crate) fn adjacent_attribute_start(source: &str, declaration_start: usize) -> Option<usize> {
-    let mut current = line_start_offset(source, declaration_start);
+    let positions = Utf16LineIndex::new(source);
+    let mut row = positions.offset_to_position(declaration_start).0;
     let mut first_attribute_start = None;
-
-    while current > 0 {
-        let previous_end = current.saturating_sub(1);
-        let previous_start = source[..previous_end]
-            .rfind('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let line = source.get(previous_start..previous_end).unwrap_or("");
-        let trimmed = line.trim();
-        if trimmed.starts_with("#[") {
-            first_attribute_start = Some(previous_start);
-            current = previous_start;
-            continue;
+    while row > 0 {
+        let span = positions.line_range(row - 1)?;
+        if !source[span.clone()].trim().starts_with("#[") {
+            break;
         }
-        break;
+        first_attribute_start = Some(span.start);
+        row -= 1;
     }
 
     first_attribute_start
@@ -3242,11 +3246,12 @@ pub(crate) fn find_constructor_assignment_line(
     let body = source.get(body_start..body_end)?;
     let expected = format!("$this->{} = ${};", property_name, property_name);
     let mut matches = Vec::new();
-    let mut cursor = body_start;
-    for line in body.split_inclusive('\n') {
-        let line_start = cursor;
-        let line_end = cursor + line.len();
-        cursor = line_end;
+    let positions = Utf16LineIndex::new(body);
+    for row in 0..positions.line_count() {
+        let span = positions.line_range_with_ending(row as u32)?;
+        let line_start = body_start + span.start;
+        let line_end = body_start + span.end;
+        let line = &body[span];
         let trimmed = line.trim();
         if trimmed == expected {
             matches.push((line_start, line_end));
@@ -4269,20 +4274,18 @@ pub(crate) fn class_constant_insertion(
     let end = byte_offset_for_line_col(source, class_sym.range.2, class_sym.range.3)?;
     let class_text = source.get(start..end)?;
     let open_brace = start + class_text.find('{')?;
-    let open_line_end = line_end_offset(source, open_brace);
-    let has_open_line_break = source.as_bytes().get(open_line_end) == Some(&b'\n');
+    let positions = Utf16LineIndex::new(source);
+    let open_row = positions.offset_to_position(open_brace).0;
+    let content = positions.line_range(open_row)?;
+    let full = positions.line_range_with_ending(open_row)?;
+    let has_open_line_break = full.end > content.end;
     let insert_byte = if has_open_line_break {
-        open_line_end + 1
+        full.end
     } else {
         open_brace + 1
     };
-    let (line, byte_col) = line_col_for_byte_offset(source, insert_byte);
-    let utf16_index = Utf16LineIndex::new(source);
-    let position = Position::new(line, utf16_index.byte_col_to_utf16(line, byte_col));
-
-    let open_line = line_text(source, line_col_for_byte_offset(source, open_brace).0);
-    let open_col = line_col_for_byte_offset(source, open_brace).1;
-    let class_indent = leading_ascii_whitespace(line_prefix_by_byte_col(open_line, open_col));
+    let position = position_from_offset(&positions, insert_byte);
+    let class_indent = leading_ascii_whitespace(&source[content.start..open_brace]);
     let member_indent = format!("{}    ", class_indent);
     let needs_trailing_blank = source
         .get(insert_byte..end)
@@ -5124,7 +5127,7 @@ pub(crate) fn phpdoc_line_is_tag(line: &str) -> bool {
 }
 
 pub(crate) fn phpdoc_content_lines(doc_comment: &str) -> Vec<String> {
-    let raw_lines: Vec<&str> = doc_comment.lines().collect();
+    let raw_lines: Vec<&str> = php_lsp_parser::line_index::logical_lines(doc_comment).collect();
     let mut lines = Vec::new();
 
     for raw in raw_lines.iter() {
@@ -5486,14 +5489,10 @@ pub(crate) fn render_phpdoc_comment(indent: &str, content_lines: &[String]) -> S
 }
 
 pub(crate) fn line_start_offset(source: &str, offset: usize) -> usize {
-    source[..offset].rfind('\n').map(|idx| idx + 1).unwrap_or(0)
+    php_lsp_parser::line_index::logical_line_at_offset(source, offset).start
 }
-
 pub(crate) fn line_end_offset(source: &str, offset: usize) -> usize {
-    source[offset..]
-        .find('\n')
-        .map(|idx| offset + idx)
-        .unwrap_or(source.len())
+    php_lsp_parser::line_index::logical_line_at_offset(source, offset).end
 }
 
 pub(crate) fn line_indent_at_offset(source: &str, offset: usize) -> String {
@@ -6027,6 +6026,15 @@ pub(crate) fn diagnostic_data(diagnostic: &Diagnostic) -> Option<PhpLspDiagnosti
     serde_json::from_value::<PhpLspDiagnosticData>(data).ok()
 }
 
+// Upstream analyzer line conventions for bare CR have no verified adapter yet.
+// Keep reporting diagnostics, but do not apply ambiguous source edits.
+pub(crate) fn external_analyzer_edits_supported(source: &str) -> bool {
+    !source
+        .bytes()
+        .enumerate()
+        .any(|(i, byte)| byte == b'\r' && source.as_bytes().get(i + 1) != Some(&b'\n'))
+}
+
 pub(crate) fn diagnostic_external_analyzer(diagnostic: &Diagnostic) -> Option<ExternalAnalyzer> {
     match diagnostic
         .source
@@ -6144,7 +6152,10 @@ pub(crate) fn build_diagnostic_replacement_action(
     replacement: &DiagnosticReplacement,
     is_preferred: bool,
 ) -> Option<CodeActionOrCommand> {
-    if replacement.new_text.trim().is_empty() {
+    if (diagnostic_external_analyzer(diagnostic).is_some()
+        && !external_analyzer_edits_supported(source))
+        || replacement.new_text.trim().is_empty()
+    {
         return None;
     }
 
@@ -6458,6 +6469,9 @@ pub(crate) fn build_external_analyzer_fix_actions(
     analyzer: ExternalAnalyzer,
     data: Option<&PhpLspDiagnosticData>,
 ) -> Vec<CodeActionOrCommand> {
+    if !external_analyzer_edits_supported(source) {
+        return Vec::new();
+    }
     let mut actions = Vec::new();
     if let Some(action) =
         build_ignore_external_analyzer_action(uri.clone(), source, diagnostic, analyzer)
@@ -6984,24 +6998,26 @@ impl PhpLspBackend {
             Vec::new()
         };
 
+        let external_edits_supported = external_analyzer_edits_supported(&source);
         let has_fix_metadata = diagnostics
             .iter()
             .any(|d| diagnostic_data(d).is_some_and(|data| data.snapshot.is_some()));
         let fix_index_revision = request_index.revision_snapshot();
-        let regenerated = if has_fix_metadata && analyzer_code_actions.enabled {
-            Some(
-                self.attach_analyzer_fix_metadata(
-                    &request,
-                    &action_snapshot,
-                    &uri_str,
-                    diagnostics.clone(),
-                    &OperationCancellationToken::new(),
+        let regenerated =
+            if has_fix_metadata && analyzer_code_actions.enabled && external_edits_supported {
+                Some(
+                    self.attach_analyzer_fix_metadata(
+                        &request,
+                        &action_snapshot,
+                        &uri_str,
+                        diagnostics.clone(),
+                        &OperationCancellationToken::new(),
+                    )
+                    .await,
                 )
-                .await,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         for (position, diagnostic) in diagnostics.into_iter().enumerate() {
             let data = diagnostic_data(&diagnostic);
             if data.as_ref().is_some_and(|data| data.snapshot.is_some())
@@ -7012,6 +7028,9 @@ impl PhpLspBackend {
                 continue;
             }
             let analyzer = diagnostic_external_analyzer(&diagnostic);
+            if analyzer.is_some() && !external_edits_supported {
+                continue;
+            }
 
             if analyzer.is_none_or(|_| analyzer_code_actions.enabled) {
                 if let Some(replacement) = data.as_ref().and_then(|data| data.replacement.as_ref())

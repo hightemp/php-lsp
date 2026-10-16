@@ -411,9 +411,10 @@ impl PhpLspBackend {
             None => return Ok(None),
         };
         let source = parser.source();
-        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let positions = Utf16LineIndex::new(&source);
+        let (byte_line, byte_col) = positions.position_to_point(pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-        let sym = match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
+        let sym = match symbol_at_position(tree, &source, byte_line, byte_col, &file_symbols) {
             Some(sym) => sym,
             None => return Ok(None),
         };
@@ -421,9 +422,11 @@ impl PhpLspBackend {
         let _names = function_name_scope_from_index(&request_index, tree, &source, &file_symbols);
         if sym.ref_kind == RefKind::Variable {
             let highlights: Vec<DocumentHighlight> =
-                find_variable_references_at_position(tree, &source, pos.line, byte_col, true)
+                find_variable_references_at_position(tree, &source, byte_line, byte_col, true)
                     .into_iter()
-                    .map(|reference| document_highlight_from_reference(&source, &reference, true))
+                    .map(|reference| {
+                        document_highlight_from_reference(&positions, &reference, true)
+                    })
                     .collect();
             return if highlights.is_empty() {
                 Ok(None)
@@ -478,7 +481,7 @@ impl PhpLspBackend {
             find_references_in_file(tree, &source, &file_symbols, &target_fqn, target_kind, true)
                 .into_iter()
                 .map(|reference| {
-                    document_highlight_from_reference(&source, &reference, read_write_capable)
+                    document_highlight_from_reference(&positions, &reference, read_write_capable)
                 })
                 .collect();
 
@@ -515,7 +518,8 @@ impl PhpLspBackend {
                 None => return Ok(None),
             };
             let source = parser.source();
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let positions = Utf16LineIndex::new(&source);
+            let (byte_line, byte_col) = positions.position_to_point(pos.line, pos.character);
             let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
@@ -528,7 +532,7 @@ impl PhpLspBackend {
             match symbol_at_position_with_resolvers(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -545,7 +549,7 @@ impl PhpLspBackend {
                         let refs = find_variable_references_at_position(
                             tree,
                             &source,
-                            pos.line,
+                            byte_line,
                             byte_col,
                             include_declaration,
                         );
@@ -559,7 +563,7 @@ impl PhpLspBackend {
                         let locations: Vec<Location> = refs
                             .into_iter()
                             .map(|r| {
-                                let rng = range_byte_to_utf16(&source, r.range);
+                                let rng = positions.range_to_lsp(r.range);
                                 Location {
                                     uri: uri.clone(),
                                     range: Range {
@@ -643,12 +647,12 @@ impl PhpLspBackend {
 }
 
 fn document_highlight_from_reference(
-    source: &str,
+    positions: &Utf16LineIndex,
     reference: &php_lsp_parser::references::ReferenceLocation,
     read_write_capable: bool,
 ) -> DocumentHighlight {
     DocumentHighlight {
-        range: crate::util::lsp_text::range_from_byte_range(source, reference.range),
+        range: range_from_lsp_tuple(positions.range_to_lsp(reference.range)),
         kind: Some(if !read_write_capable {
             DocumentHighlightKind::TEXT
         } else if reference.is_write {

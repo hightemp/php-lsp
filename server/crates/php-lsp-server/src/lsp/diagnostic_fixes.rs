@@ -8,14 +8,8 @@ fn node_range(positions: &Utf16LineIndex, node: tree_sitter::Node) -> Range {
     let start = node.start_position();
     let end = node.end_position();
     Range::new(
-        Position::new(
-            start.row as u32,
-            positions.byte_col_to_utf16(start.row as u32, start.column as u32),
-        ),
-        Position::new(
-            end.row as u32,
-            positions.byte_col_to_utf16(end.row as u32, end.column as u32),
-        ),
+        position_from_byte_point(positions, start.row as u32, start.column as u32),
+        position_from_byte_point(positions, end.row as u32, end.column as u32),
     )
 }
 
@@ -38,7 +32,6 @@ struct FixContext<'a> {
     references: Vec<SymbolReference>,
     callables: Vec<(tree_sitter::Node<'a>, Range)>,
     positions: Utf16LineIndex,
-    line_starts: Vec<usize>,
     cancel: &'a OperationCancellationToken,
     snapshot: FixSnapshot,
 }
@@ -61,14 +54,6 @@ impl<'a> FixContext<'a> {
         #[cfg(test)]
         RANGE_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
         let positions = Utf16LineIndex::new(source);
-        let line_starts = std::iter::once(0)
-            .chain(
-                source
-                    .bytes()
-                    .enumerate()
-                    .filter_map(|(i, b)| (b == b'\n').then_some(i + 1)),
-            )
-            .collect();
         let mut callables = Vec::new();
         let mut cursor = tree.walk();
         loop {
@@ -114,7 +99,6 @@ impl<'a> FixContext<'a> {
             callables,
             references,
             positions,
-            line_starts,
             cancel,
             snapshot: FixSnapshot {
                 uri: uri.into(),
@@ -184,7 +168,10 @@ impl<'a> FixContext<'a> {
     }
 
     pub(in crate::server) fn metadata(&self, diagnostic: &Diagnostic) -> Option<serde_json::Value> {
-        if self.cancel.is_cancelled() || self.tree.root_node().has_error() {
+        if self.cancel.is_cancelled()
+            || self.tree.root_node().has_error()
+            || self.positions.has_bare_cr()
+        {
             return None;
         }
         let analyzer = diagnostic_external_analyzer(diagnostic)?;
@@ -431,20 +418,8 @@ impl<'a> FixContext<'a> {
     }
 
     fn offset(&self, position: Position) -> Option<usize> {
-        let start = *self.line_starts.get(position.line as usize)?;
-        let end = self
-            .line_starts
-            .get(position.line as usize + 1)
-            .copied()
-            .unwrap_or(self.source.len());
-        Some(
-            start
-                + php_lsp_parser::utf16::utf16_col_to_byte(
-                    &self.source[start..end],
-                    0,
-                    position.character,
-                ) as usize,
-        )
+        self.positions
+            .position_to_offset(position.line, position.character)
     }
 
     fn null_default(&self, owner: &SymbolInfo, param: &php_lsp_types::ParamInfo) -> Option<bool> {

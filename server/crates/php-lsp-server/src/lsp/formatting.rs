@@ -5,21 +5,25 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn full_document_range(source: &str) -> Range {
-    let mut line = 0u32;
-    let mut character = 0u32;
+    let index = Utf16LineIndex::new(source);
+    Range::new(
+        Position::new(0, 0),
+        position_from_offset(&index, source.len()),
+    )
+}
 
-    for ch in source.chars() {
-        if ch == '\n' {
-            line += 1;
-            character = 0;
-        } else {
-            character += ch.len_utf16() as u32;
-        }
-    }
-
-    Range {
-        start: Position::new(0, 0),
-        end: Position::new(line, character),
+#[test]
+fn line_model_full_document_replacement_range_ends_at_client_eof() {
+    for (source, end) in [
+        ("", Position::new(0, 0)),
+        ("<?php\r$x='😀';", Position::new(1, 8)),
+        ("a\r\n\rb\n", Position::new(3, 0)),
+        ("\u{2028}\u{2029}\u{85}\u{b}\u{c}", Position::new(0, 5)),
+    ] {
+        assert_eq!(
+            full_document_range(source),
+            Range::new(Position::new(0, 0), end)
+        );
     }
 }
 
@@ -270,7 +274,7 @@ fn strip_range_formatter_wrapper(formatted: String, was_wrapped: bool) -> Option
 }
 
 fn formatting_source_line(source: &str, line: u32) -> Option<&str> {
-    source.split('\n').nth(line as usize)
+    php_lsp_parser::line_index::logical_lines(source).nth(line as usize)
 }
 
 fn leading_indent(line: &str) -> &str {
@@ -308,7 +312,7 @@ fn brace_delta(line: &str) -> isize {
 
 fn brace_depth_before_line(source: &str, line: u32) -> usize {
     let mut depth = 0isize;
-    for row in source.split('\n').take(line as usize) {
+    for row in php_lsp_parser::line_index::logical_lines(source).take(line as usize) {
         depth = (depth + brace_delta(row)).max(0);
     }
     depth as usize

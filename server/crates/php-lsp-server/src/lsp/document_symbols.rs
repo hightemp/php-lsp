@@ -1,7 +1,7 @@
 //! Document Symbols LSP handlers extracted from `server.rs`.
 
 use super::super::*;
-use super::completion_helpers::{byte_offset_to_line_col, byte_offsets_to_range};
+use super::completion_helpers::byte_offset_to_line_col;
 use crate::util::lsp_text::byte_offset_for_line_col;
 
 #[derive(Debug, Clone)]
@@ -238,11 +238,11 @@ fn workspace_symbol_container_name(symbol: &php_lsp_types::SymbolInfo) -> Option
     })
 }
 
-async fn workspace_symbol_source_for_uri(
+async fn workspace_symbol_positions_for_uri(
     uri_str: &str,
     open_files: &DashMap<String, FileParser>,
-    source_cache: &mut HashMap<String, Option<String>>,
-) -> Option<String> {
+    source_cache: &mut HashMap<String, Option<Arc<Utf16LineIndex>>>,
+) -> Option<Arc<Utf16LineIndex>> {
     if let Some(cached) = source_cache.get(uri_str) {
         return cached.clone();
     }
@@ -258,18 +258,20 @@ async fn workspace_symbol_source_for_uri(
         None
     };
 
-    source_cache.insert(uri_str.to_string(), source.clone());
-    source
+    let positions = source.map(|source| Arc::new(Utf16LineIndex::new(&source)));
+    source_cache.insert(uri_str.to_string(), positions.clone());
+    positions
 }
 
 async fn workspace_symbol_information(
     symbol: &php_lsp_types::SymbolInfo,
     open_files: &DashMap<String, FileParser>,
-    source_cache: &mut HashMap<String, Option<String>>,
+    source_cache: &mut HashMap<String, Option<Arc<Utf16LineIndex>>>,
 ) -> Option<SymbolInformation> {
     let uri: Uri = symbol.uri.parse().ok()?;
-    let source = workspace_symbol_source_for_uri(&symbol.uri, open_files, source_cache).await?;
-    let range = workspace_symbol_lsp_range(&source, symbol.range);
+    let positions =
+        workspace_symbol_positions_for_uri(&symbol.uri, open_files, source_cache).await?;
+    let range = range_from_lsp_tuple(positions.range_to_lsp(symbol.range));
 
     #[allow(deprecated)]
     Some(SymbolInformation {
@@ -286,6 +288,7 @@ async fn workspace_symbol_information(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn workspace_symbol_lsp_range(source: &str, range: (u32, u32, u32, u32)) -> Range {
     range_from_byte_range(source, range)
 }
@@ -312,8 +315,9 @@ impl PhpLspBackend {
             None => return Ok(None),
         };
         let source = parser.source();
-        let byte_col = utf16_col_to_byte(&source, position.line, position.character);
-        let point = tree_sitter::Point::new(position.line as usize, byte_col as usize);
+        let (byte_line, byte_col) =
+            lsp_position_to_byte_point(&source, position.line, position.character);
+        let point = tree_sitter::Point::new(byte_line as usize, byte_col as usize);
         let root = tree.root_node();
         let mut node = match root.descendant_for_point_range(point, point) {
             Some(node) => node,
@@ -419,8 +423,8 @@ impl PhpLspBackend {
         }
 
         // Helper to convert SymbolInfo range to LSP Range
-        let to_range =
-            |range: (u32, u32, u32, u32)| -> Range { range_from_byte_range(&source, range) };
+        let positions = Utf16LineIndex::new(&source);
+        let to_range = |range| range_from_lsp_tuple(positions.range_to_lsp(range));
 
         // Build DocumentSymbol for a symbol with its children
         #[allow(deprecated)] // DocumentSymbol.deprecated field
@@ -536,7 +540,7 @@ impl PhpLspBackend {
                 tags: None,
                 deprecated: None,
                 range: to_range(scope.range),
-                selection_range: namespace_selection_range(&source, scope),
+                selection_range: namespace_selection_range(&source, scope, &positions),
                 children: if children.is_empty() {
                     None
                 } else {
@@ -611,8 +615,12 @@ impl PhpLspBackend {
 
 /// Scope metadata keeps the whole section range. Locate its declared name
 /// without reparsing indexed files; comments before the name are only trivia.
-fn namespace_selection_range(source: &str, scope: &php_lsp_types::NamespaceScope) -> Range {
-    let section = range_from_byte_range(source, scope.range);
+fn namespace_selection_range(
+    source: &str,
+    scope: &php_lsp_types::NamespaceScope,
+    positions: &Utf16LineIndex,
+) -> Range {
+    let section = range_from_lsp_tuple(positions.range_to_lsp(scope.range));
     let fallback = Range::new(section.start, section.start);
     let Some(name) = scope.namespace.as_deref() else {
         return fallback;
@@ -634,7 +642,7 @@ fn namespace_selection_range(source: &str, scope: &php_lsp_types::NamespaceScope
             };
             header = &comment[end + "*/".len()..];
         } else if header.starts_with("//") || header.starts_with('#') {
-            let Some(end) = header.find('\n') else {
+            let Some(end) = header.find(['\r', '\n']) else {
                 return fallback;
             };
             header = &header[end + 1..];
@@ -646,9 +654,9 @@ fn namespace_selection_range(source: &str, scope: &php_lsp_types::NamespaceScope
         return fallback;
     }
     let name_start = end - header.len();
-    range_from_byte_range(
-        source,
-        byte_offsets_to_range(source, name_start, name_start + name.len()),
+    Range::new(
+        position_from_offset(positions, name_start),
+        position_from_offset(positions, name_start + name.len()),
     )
 }
 

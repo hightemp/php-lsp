@@ -1,6 +1,5 @@
 //! Document Links LSP handlers extracted from `server.rs`.
 
-use crate::util::lsp_text::range_from_byte_range;
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
@@ -212,6 +211,7 @@ fn collect_document_links(
     file_path: &Path,
     file_dir: &Path,
     links: &mut Vec<DocumentLink>,
+    positions: &Utf16LineIndex,
 ) {
     if is_document_link_include_expression(node.kind()) {
         if let Some(expression) = node.named_child(0) {
@@ -223,7 +223,9 @@ fn collect_document_links(
                     .and_then(|uri| uri.parse::<Uri>().ok())
                 {
                     links.push(DocumentLink {
-                        range: range_from_byte_range(source, node_byte_range(expression)),
+                        range: range_from_lsp_tuple(
+                            positions.range_to_lsp(node_byte_range(expression)),
+                        ),
                         target: Some(target),
                         tooltip: Some(target_path.display().to_string()),
                         data: None,
@@ -235,7 +237,7 @@ fn collect_document_links(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_document_links(child, source, file_path, file_dir, links);
+        collect_document_links(child, source, file_path, file_dir, links, positions);
     }
 }
 
@@ -291,7 +293,14 @@ fn document_links_for_source(
     };
 
     let mut links = Vec::new();
-    collect_document_links(tree.root_node(), source, file_path, file_dir, &mut links);
+    collect_document_links(
+        tree.root_node(),
+        source,
+        file_path,
+        file_dir,
+        &mut links,
+        &Utf16LineIndex::new(source),
+    );
     links
 }
 

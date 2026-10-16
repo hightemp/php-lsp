@@ -6,6 +6,7 @@
 mod cst;
 pub mod diagnostics;
 pub mod function_names;
+pub mod line_index;
 pub mod parser;
 pub mod phpdoc;
 pub mod references;

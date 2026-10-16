@@ -328,3 +328,30 @@ async fn qfm_cancelled_validation_stops_its_worker_and_releases_the_permit() {
     .await
     .unwrap();
 }
+
+#[test]
+fn line_model_external_metadata_requires_an_unambiguous_line_contract() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let source =
+            format!("<?php{eol}function f():void {{throw new \\RuntimeException();}}{eol}");
+        let (parser, file, index) = parser(&source);
+        let cancel = OperationCancellationToken::new();
+        let context = FixContext::new(
+            URI,
+            &source,
+            parser.tree().unwrap(),
+            &file,
+            &index,
+            None,
+            0,
+            &cancel,
+        )
+        .unwrap();
+        let diagnostic=diagnostic(1,"missingType.checkedException","Function f() throws checked exception RuntimeException but it's missing from the PHPDoc @throws tag.");
+        assert_eq!(
+            context.metadata(&diagnostic).is_some(),
+            eol != "\r",
+            "{eol:?}"
+        );
+    }
+}

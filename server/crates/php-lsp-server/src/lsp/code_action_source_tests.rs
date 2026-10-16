@@ -412,3 +412,76 @@ fn p240_analyzer_markers_preserve_inline_php_and_reject_comment_injection() {
         }
     }
 }
+
+#[test]
+fn line_model_refactor_helpers_preserve_cr_attributes_and_member_indentation() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let source = format!("<?php{eol}    class Box {{{eol}        #[Mark]{eol}        public int $value;{eol}        function run() {{return 42;}}{eol}    }}");
+        let (parser, file) = parse(&source);
+        let declaration = source.find("public").unwrap();
+        assert_eq!(
+            adjacent_attribute_start(&source, declaration),
+            Some(source.find("        #[").unwrap()),
+            "{eol:?}"
+        );
+        let class = file.symbols.iter().find(|s| s.name == "Box").unwrap();
+        let insertion = class_constant_insertion(&source, class).unwrap();
+        assert_eq!(insertion.position, Position::new(2, 0), "{eol:?}");
+        assert_eq!(insertion.member_indent, "        ");
+        assert!(!insertion.needs_leading_newline);
+        let start = source.find("42").unwrap();
+        let a = parser.line_index().offset_to_point(start);
+        let b = parser.line_index().offset_to_point(start + 2);
+        let edit = extract_constant_edit(
+            URI.parse().unwrap(),
+            parser.tree().unwrap(),
+            &source,
+            &file,
+            (a.0, a.1, b.0, b.1),
+            "VALUE",
+        )
+        .unwrap();
+        let edited = apply(&source, edit);
+        assert!(
+            edited.contains("        private const VALUE = 42;"),
+            "{edited:?}"
+        );
+        assert!(
+            edited.contains(&format!("        #[Mark]{eol}        public int $value;")),
+            "{edited:?}"
+        );
+        assert!(edited.contains("return self::VALUE;"));
+    }
+}
+
+#[test]
+fn line_model_external_ignore_actions_reject_unadapted_bare_cr_ranges() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let source = format!("<?php{eol}/* a\u{2028}b */ fail();{eol}");
+        for analyzer in [ExternalAnalyzer::Psalm, ExternalAnalyzer::PhpStan] {
+            let diagnostic = diagnostic(&source, "fail", "psalm");
+            let edit = structural_source::analyzer_ignore_edit(
+                URI.parse().unwrap(),
+                &source,
+                &diagnostic,
+                analyzer,
+            );
+            assert_eq!(edit.is_some(), eol != "\r", "{eol:?}: {analyzer:?}");
+            if let Some(edit) = edit {
+                assert!(apply(&source, edit).contains("fail();"));
+            }
+        }
+    }
+}
+
+#[test]
+fn line_model_framework_string_completion_stops_at_each_line_ending() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let source = format!("unfinished{eol} next'");
+        assert_eq!(
+            crate::server::lsp::completion_helpers::find_unescaped_quote(&source, 0, '\''),
+            None,
+            "{eol:?}"
+        );
+    }
+}

@@ -1,3 +1,4 @@
+#![allow(deprecated)] // Compatibility checks for the legacy scalar-column API.
 use super::*;
 
 fn reference_byte_to_utf16(line_text: &str, byte_col: u32) -> u32 {
@@ -40,9 +41,12 @@ fn line_text(source: &str, line: u32) -> &str {
 
 fn assert_line_conversions(source: &str, line: u32) {
     let idx = Utf16LineIndex::new(source);
-    let text = line_text(source, line);
-    let max_byte = text.len() as u32 + 4;
-    let max_utf16 = text.encode_utf16().count() as u32 + 4;
+    let raw = line_text(source, line);
+    // Neither byte of CRLF is an addressable LSP character. Keep probing those
+    // columns, but compare against the content boundary rather than counting CR.
+    let text = raw.strip_suffix('\r').unwrap_or(raw);
+    let max_byte = raw.len() as u32 + 4;
+    let max_utf16 = raw.encode_utf16().count() as u32 + 4;
 
     for byte_col in 0..=max_byte {
         let expected = reference_byte_to_utf16(text, byte_col);

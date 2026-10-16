@@ -6,7 +6,6 @@
 
 use crate::cst::{argument_index, argument_name};
 use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
-use crate::utf16::utf16_col_to_byte;
 use php_lsp_types::{
     symbol_fqn_eq, FileSymbols, PhpSymbolKind, Signature, SymbolInfo, TypeInfo, UseKind,
 };
@@ -698,7 +697,7 @@ fn infer_variable_type_at_position_internal(
     let scoped_file_symbols =
         file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
     let file_symbols = scoped_file_symbols.as_ref();
-    let usage_start = position_to_byte(source, line, character);
+    let usage_start = byte_position_to_offset(source, line, character);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
     infer_textual_expression_type_info(
         scope,
@@ -4105,7 +4104,7 @@ fn find_preceding_phpdoc_comment<'a>(node: Node<'a>, source: &'a str) -> Option<
 }
 
 fn parse_tagged_var_name(comment: &str) -> Option<String> {
-    for raw_line in comment.lines() {
+    for raw_line in crate::line_index::logical_lines(comment) {
         let mut line = raw_line.trim();
         if let Some(rest) = line.strip_prefix("/**") {
             line = rest.trim_start();
@@ -4976,7 +4975,7 @@ fn skip_ws_and_php_comments(text: &str, mut index: usize) -> usize {
         }
         if text[index..].starts_with("//") || text[index..].starts_with('#') {
             index = text[index..]
-                .find('\n')
+                .find(['\r', '\n'])
                 .map(|offset| index + offset + 1)
                 .unwrap_or(text.len());
             continue;
@@ -6743,25 +6742,6 @@ pub fn normalize_array_access_key(raw: &str) -> Option<String> {
         return php_lsp_types::decode_shape_key_token(raw);
     }
     php_lsp_types::canonical_shape_key_integer(raw).map(|integer| integer.to_string())
-}
-
-fn position_to_byte(source: &str, line: u32, character: u32) -> usize {
-    let mut offset = 0usize;
-    let line_idx = line as usize;
-    for (i, row) in source.split_inclusive('\n').enumerate() {
-        let line_text = row.strip_suffix('\n').unwrap_or(row);
-        if i == line_idx {
-            let byte_col = utf16_col_to_byte(source, line, character) as usize;
-            return offset + byte_col.min(line_text.len());
-        }
-        offset += row.len();
-    }
-
-    if line_idx == source.split_inclusive('\n').count() {
-        return source.len();
-    }
-
-    source.len()
 }
 
 /// Resolve a simple name node to a SymbolAtPosition.

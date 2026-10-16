@@ -65,7 +65,7 @@ pub fn parse_phpdoc(comment: &str) -> PhpDoc {
 
 fn strip_comment_markers(comment: &str) -> Vec<String> {
     let mut lines = Vec::new();
-    for line in comment.lines() {
+    for line in crate::line_index::logical_lines(comment) {
         lines.push(strip_comment_line_markers(line).to_string());
     }
     lines
@@ -94,7 +94,7 @@ pub fn phpdoc_member_name_span(
 ) -> Option<(usize, usize)> {
     let mut text = String::new();
     let mut segments = Vec::new();
-    for line in comment.lines().chain(std::iter::once("")) {
+    for line in crate::line_index::logical_lines(comment).chain(std::iter::once("")) {
         let content = strip_comment_line_markers(line);
         if content.starts_with('@') || content.is_empty() {
             if let Some(span) = member_span_in_tag(&text, name, kind) {

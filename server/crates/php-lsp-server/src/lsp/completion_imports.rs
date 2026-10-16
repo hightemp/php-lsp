@@ -98,11 +98,14 @@ fn safe_import_location(
     edit: &TextEdit,
     replacement: Range,
 ) -> bool {
-    let position = (edit.range.start.line, edit.range.start.character);
+    let positions = Utf16LineIndex::new(source);
+    let position = positions.position_to_point(edit.range.start.line, edit.range.start.character);
     // The existing line-oriented builder must not insert before the PHP tag,
     // into another namespace/body, or at the main completion replacement.
     if position == (0, 0)
-        || crate::util::lsp_text::byte_offset_for_line_col(source, position.0, 0).is_none()
+        || positions
+            .position_to_offset(edit.range.start.line, edit.range.start.character)
+            .is_none()
     {
         return false;
     }
@@ -114,7 +117,12 @@ fn safe_import_location(
     }) {
         return false;
     }
-    let offset = crate::util::lsp_text::byte_offset_for_line_col(source, position.0, 0).unwrap();
+    let offset = positions
+        .position_to_offset(edit.range.start.line, edit.range.start.character)
+        .unwrap();
+    if offset == 0 {
+        return false;
+    }
     let mut cursor = tree.root_node().walk();
     if tree
         .root_node()

@@ -129,12 +129,8 @@ pub(crate) fn extract_root_symbols(
     let utf16 = crate::utf16::Utf16LineIndex::new(source);
     for symbol in &mut result.symbols {
         if let Some((line, column, end_line, end_column)) = symbol.doc_comment_range {
-            symbol.doc_comment_range = Some((
-                line,
-                utf16.byte_col_to_utf16(line, column),
-                end_line,
-                utf16.byte_col_to_utf16(end_line, end_column),
-            ));
+            symbol.doc_comment_range =
+                Some(utf16.range_to_lsp((line, column, end_line, end_column)));
         }
     }
     let snapshot = result.clone();
@@ -1875,7 +1871,7 @@ fn phpdoc_var_type_for_property(doc_comment: &str, raw_property_name: &str) -> O
 }
 
 fn phpdoc_tagged_var_name(doc_comment: &str) -> Option<String> {
-    for raw_line in doc_comment.lines() {
+    for raw_line in crate::line_index::logical_lines(doc_comment) {
         let mut line = raw_line.trim();
         if let Some(rest) = line.strip_prefix("/**") {
             line = rest.trim_start();

@@ -1788,14 +1788,8 @@ pub(in crate::server) fn semantic_diagnostic_to_lsp(
     let severity = severity_config.severity(category)?;
     Some(Diagnostic {
         range: Range {
-            start: Position::new(
-                diagnostic.range.0,
-                utf16_index.byte_col_to_utf16(diagnostic.range.0, diagnostic.range.1),
-            ),
-            end: Position::new(
-                diagnostic.range.2,
-                utf16_index.byte_col_to_utf16(diagnostic.range.2, diagnostic.range.3),
-            ),
+            start: position_from_byte_point(utf16_index, diagnostic.range.0, diagnostic.range.1),
+            end: position_from_byte_point(utf16_index, diagnostic.range.2, diagnostic.range.3),
         },
         severity: Some(severity),
         code: Some(NumberOrString::String(
@@ -1865,8 +1859,8 @@ pub(in crate::server) fn diagnostic_at_byte_range(
 ) -> Diagnostic {
     Diagnostic {
         range: Range {
-            start: Position::new(range.0, utf16_index.byte_col_to_utf16(range.0, range.1)),
-            end: Position::new(range.2, utf16_index.byte_col_to_utf16(range.2, range.3)),
+            start: position_from_byte_point(utf16_index, range.0, range.1),
+            end: position_from_byte_point(utf16_index, range.2, range.3),
         },
         severity: Some(DiagnosticSeverity::WARNING),
         source: Some("php-lsp".to_string()),
@@ -4738,13 +4732,15 @@ pub(in crate::server) fn workspace_duplicate_symbol_diagnostics(
         if has_duplicate {
             diagnostics.push(Diagnostic {
                 range: Range {
-                    start: Position::new(
+                    start: position_from_byte_point(
+                        utf16_index,
                         sym.selection_range.0,
-                        utf16_index.byte_col_to_utf16(sym.selection_range.0, sym.selection_range.1),
+                        sym.selection_range.1,
                     ),
-                    end: Position::new(
+                    end: position_from_byte_point(
+                        utf16_index,
                         sym.selection_range.2,
-                        utf16_index.byte_col_to_utf16(sym.selection_range.2, sym.selection_range.3),
+                        sym.selection_range.3,
                     ),
                 },
                 severity: Some(DiagnosticSeverity::WARNING),

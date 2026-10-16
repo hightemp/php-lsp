@@ -26,7 +26,8 @@ impl PhpLspBackend {
             };
             (tree, parser.source())
         };
-        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let positions = Utf16LineIndex::new(&source);
+        let (byte_line, byte_col) = positions.position_to_point(pos.line, pos.character);
         let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
 
         let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
@@ -38,7 +39,7 @@ impl PhpLspBackend {
         let sym = match symbol_at_position_with_resolvers(
             &tree,
             &source,
-            pos.line,
+            byte_line,
             byte_col,
             &file_symbols,
             Some(&resolver),
@@ -62,7 +63,7 @@ impl PhpLspBackend {
                 ))
             })?;
             let refs =
-                find_variable_references_at_position(&tree, &source, pos.line, byte_col, true);
+                find_variable_references_at_position(&tree, &source, byte_line, byte_col, true);
             if refs.is_empty() {
                 return Ok(None);
             }
@@ -73,7 +74,7 @@ impl PhpLspBackend {
             let edits: Vec<TextEdit> = refs
                 .into_iter()
                 .map(|r| {
-                    let rng = range_byte_to_utf16(&source, r.range);
+                    let rng = positions.range_to_lsp(r.range);
                     TextEdit {
                         range: Range {
                             start: Position::new(rng.0, rng.1),
@@ -251,7 +252,8 @@ impl PhpLspBackend {
             None => return Ok(None),
         };
         let source = parser.source();
-        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let positions = Utf16LineIndex::new(&source);
+        let (byte_line, byte_col) = positions.position_to_point(pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
         let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
@@ -264,7 +266,7 @@ impl PhpLspBackend {
         match symbol_at_position_with_resolvers(
             tree,
             &source,
-            pos.line,
+            byte_line,
             byte_col,
             &file_symbols,
             Some(&resolver),
@@ -282,12 +284,14 @@ impl PhpLspBackend {
                     if !is_renameable_variable(&sym.name) {
                         return Ok(None);
                     }
-                    if find_variable_references_at_position(tree, &source, pos.line, byte_col, true)
-                        .is_empty()
+                    if find_variable_references_at_position(
+                        tree, &source, byte_line, byte_col, true,
+                    )
+                    .is_empty()
                     {
                         return Ok(None);
                     }
-                    let rng = range_byte_to_utf16(&source, sym.range);
+                    let rng = positions.range_to_lsp(sym.range);
                     let range = Range {
                         start: Position::new(rng.0, rng.1),
                         end: Position::new(rng.2, rng.3),
@@ -359,7 +363,7 @@ impl PhpLspBackend {
                 } else {
                     sym.range
                 };
-                let rng2 = range_byte_to_utf16(&source, prepare_byte_range);
+                let rng2 = positions.range_to_lsp(prepare_byte_range);
                 let range = Range {
                     start: Position::new(rng2.0, rng2.1),
                     end: Position::new(rng2.2, rng2.3),

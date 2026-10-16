@@ -164,11 +164,8 @@ impl PhpLspBackend {
                 response
             }
         };
-        if let Some(node) = super::composite_receivers::expression_at(
-            &tree,
-            pos.line,
-            utf16_col_to_byte(&source, pos.line, pos.character),
-        ) {
+        let (byte_line, byte_col) = lsp_position_to_byte_point(&source, pos.line, pos.character);
+        if let Some(node) = super::composite_receivers::expression_at(&tree, byte_line, byte_col) {
             super::composite_receivers::preload(
                 &tree,
                 &source,
@@ -217,7 +214,8 @@ impl PhpLspBackend {
 
         let (sym_at_pos, variable_type_fqn, file_symbols) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let (byte_line, byte_col) =
+                lsp_position_to_byte_point(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
@@ -228,7 +226,7 @@ impl PhpLspBackend {
             let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -239,7 +237,7 @@ impl PhpLspBackend {
                     variable_name_node_at_range(
                         tree,
                         &source,
-                        (pos.line, byte_col, pos.line, byte_col),
+                        (byte_line, byte_col, byte_line, byte_col),
                     )
                     .and_then(|variable_node| {
                         infer_variable_hover_info_at_node_with_resolvers(
@@ -258,7 +256,7 @@ impl PhpLspBackend {
                             tree,
                             &source,
                             &file_symbols,
-                            pos.line,
+                            byte_line,
                             byte_col,
                             &sym.name,
                             Some(&resolver),
@@ -395,7 +393,8 @@ impl PhpLspBackend {
 
         let (candidate, local_candidate) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let (byte_line, byte_col) =
+                lsp_position_to_byte_point(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
@@ -405,7 +404,7 @@ impl PhpLspBackend {
             let Some(sym_at_pos) = symbol_at_position_with_resolvers(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -579,11 +578,14 @@ impl PhpLspBackend {
                     .map(GotoDefinitionResponse::Scalar));
             }
             let original_source = template.original_source();
-            let original_byte_col =
-                utf16_col_to_byte(original_source, original_pos.line, original_pos.character);
-            if let Some(path_context) = twig_static_template_path_context_at_position(
+            let (original_byte_line, original_byte_col) = lsp_position_to_byte_point(
                 original_source,
                 original_pos.line,
+                original_pos.character,
+            );
+            if let Some(path_context) = twig_static_template_path_context_at_position(
+                original_source,
+                original_byte_line,
                 original_byte_col,
             ) {
                 if let Some(location) = self
@@ -595,7 +597,7 @@ impl PhpLspBackend {
             }
             if let Some(route_context) = twig_route_key_context_at_position(
                 original_source,
-                original_pos.line,
+                original_byte_line,
                 original_byte_col,
             ) {
                 let file_symbols = php_lsp_types::FileSymbols::default();
@@ -621,11 +623,8 @@ impl PhpLspBackend {
             original_pos
         };
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
-        if let Some(node) = super::composite_receivers::access_at(
-            &tree,
-            pos.line,
-            utf16_col_to_byte(&source, pos.line, pos.character),
-        ) {
+        let (byte_line, byte_col) = lsp_position_to_byte_point(&source, pos.line, pos.character);
+        if let Some(node) = super::composite_receivers::access_at(&tree, byte_line, byte_col) {
             super::composite_receivers::preload(
                 &tree,
                 &source,
@@ -647,7 +646,8 @@ impl PhpLspBackend {
             file_symbols,
         ) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let (byte_line, byte_col) =
+                lsp_position_to_byte_point(&source, pos.line, pos.character);
             let utf16_index = Utf16LineIndex::new(&source);
             let type_cache =
                 RequestTypeCache::new(&uri_str, document_state.map(|state| state.version));
@@ -662,12 +662,12 @@ impl PhpLspBackend {
 
             let _names =
                 function_name_scope_from_index(&request_index, tree, &source, &file_symbols);
-            let local_var_def = variable_definition_at_position(tree, &source, pos.line, byte_col)
+            let local_var_def = variable_definition_at_position(tree, &source, byte_line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
-            let shape_def = shape_definition_at_position(&source, pos.line, byte_col)
+            let shape_def = shape_definition_at_position(&source, byte_line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
             let framework_string_key_context =
-                framework_string_key_context_at_position(&source, pos.line, byte_col);
+                framework_string_key_context_at_position(&source, byte_line, byte_col);
 
             let ctx = InlayHintContext {
                 tree,
@@ -683,12 +683,13 @@ impl PhpLspBackend {
                 allow_blocking_file_io: false,
                 cancellation: None,
             };
-            let shape_member_info = shape_member_access_info_at_position(&ctx, pos.line, byte_col);
-            let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
+            let shape_member_info = shape_member_access_info_at_position(&ctx, byte_line, byte_col);
+            let inferred_member_symbol =
+                server_member_symbol_at_position(&ctx, byte_line, byte_col);
             let primary_sym = symbol_at_position_with_resolvers(
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
@@ -708,7 +709,7 @@ impl PhpLspBackend {
                 if sym.ref_kind == RefKind::Variable && sym.name == "$this" {
                     current_class_symbol_at_range(
                         &file_symbols,
-                        (pos.line, byte_col, pos.line, byte_col),
+                        (byte_line, byte_col, byte_line, byte_col),
                     )
                     .map(|class_sym| {
                         (
@@ -749,8 +750,8 @@ impl PhpLspBackend {
             &source,
             &file_symbols,
             &request_index,
-            pos.line,
-            utf16_col_to_byte(&source, pos.line, pos.character),
+            byte_line,
+            byte_col,
         ) {
             let Some(member) = super::composite_receivers::selected(
                 &request_index,
@@ -1053,10 +1054,10 @@ impl PhpLspBackend {
         let parser = self.open_files.get(&uri_str)?;
         let tree = parser.tree()?;
         let source = parser.source();
-        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let (byte_line, byte_col) = lsp_position_to_byte_point(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-        let scoped_symbols = file_symbols.scoped_at_byte_position(pos.line, byte_col);
-        let sym = symbol_at_position(tree, &source, pos.line, byte_col, &scoped_symbols)?;
+        let scoped_symbols = file_symbols.scoped_at_byte_position(byte_line, byte_col);
+        let sym = symbol_at_position(tree, &source, byte_line, byte_col, &scoped_symbols)?;
         let use_stmt = imported_use_statement_for_symbol(&scoped_symbols, &sym)?;
         let range = range_byte_to_utf16(&source, use_stmt.range);
 

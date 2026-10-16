@@ -327,6 +327,12 @@ returning edits; editing/reopening the document or changing relevant index or
 runtime state invalidates stale proposals. Analyzer commands and their trust
 settings retain their existing behavior.
 
+Files containing bare CR line endings currently receive no external-analyzer
+edit actions, including local ignores and legacy replacements: PHPStan/Psalm
+line conventions for these files have no verified adapter. Their diagnostics
+still publish, but bare-CR ranges are not guaranteed. Built-in features support
+CR; LF/CRLF analyzer actions remain available.
+
 The adapters follow the upstream [PHPStan exception rule](https://github.com/phpstan/phpstan-src/blob/2.1.x/src/Rules/Exceptions/MissingCheckedExceptionInMethodThrowsRule.php),
 [function-name rule](https://github.com/phpstan/phpstan-src/blob/2.1.x/src/Rules/Functions/CallToNonExistentFunctionRule.php)
 and [Psalm missing-throws diagnostic](https://psalm.dev/docs/running_psalm/issues/MissingThrowsDocblock/).

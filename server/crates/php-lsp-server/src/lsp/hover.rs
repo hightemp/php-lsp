@@ -29,11 +29,8 @@ impl PhpLspBackend {
             original_pos
         };
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
-        if let Some(node) = super::composite_receivers::access_at(
-            &tree,
-            pos.line,
-            utf16_col_to_byte(&source, pos.line, pos.character),
-        ) {
+        let (byte_line, byte_col) = lsp_position_to_byte_point(&source, pos.line, pos.character);
+        if let Some(node) = super::composite_receivers::access_at(&tree, byte_line, byte_col) {
             super::composite_receivers::preload(
                 &tree,
                 &source,
@@ -49,8 +46,8 @@ impl PhpLspBackend {
             &source,
             &file_symbols,
             &request_index,
-            pos.line,
-            utf16_col_to_byte(&source, pos.line, pos.character),
+            byte_line,
+            byte_col,
         ) {
             let Some(member) = super::composite_receivers::selected(
                 &request_index,
@@ -98,7 +95,6 @@ impl PhpLspBackend {
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
         let (sym_at_pos, local_var_hover, shape_member_hover, call_site_return_type, file_symbols) = {
             let tree = &tree;
-            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let utf16_index = Utf16LineIndex::new(&source);
 
             let type_cache =
@@ -134,22 +130,24 @@ impl PhpLspBackend {
             let variable_node_at_position = variable_name_node_at_range(
                 tree,
                 &source,
-                (pos.line, byte_col, pos.line, byte_col),
+                (byte_line, byte_col, byte_line, byte_col),
             );
             let local_var_hover = variable_node_at_position
                 .and_then(|variable_node| local_variable_hover_data(&ctx, variable_node));
 
-            let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
-            let shape_member_hover = shape_member_access_info_at_position(&ctx, pos.line, byte_col);
+            let inferred_member_symbol =
+                server_member_symbol_at_position(&ctx, byte_line, byte_col);
+            let shape_member_hover =
+                shape_member_access_info_at_position(&ctx, byte_line, byte_col);
             let call_site_return_type =
-                hover_call_site_return_type_at_position(&ctx, pos.line, byte_col);
+                hover_call_site_return_type_at_position(&ctx, byte_line, byte_col);
 
             // Find symbol at cursor position (with resolver for chains)
             let primary_sym_at_pos = symbol_at_position_with_request_cache(
                 &type_cache,
                 tree,
                 &source,
-                pos.line,
+                byte_line,
                 byte_col,
                 &file_symbols,
                 "hover",
