@@ -504,6 +504,9 @@ impl PhpLspBackend {
                 .then(|| self.template_document(&uri_str))
                 .flatten();
 
+            crate::dispatch::document_committed();
+            #[cfg(test)]
+            crate::dispatch::test_document_post(&uri_str, "open").await;
             self.log_trace(&format!("didOpen: {}", uri_str)).await;
             if self.current_document_state(&uri_str) != Some(document_state) {
                 return;
@@ -677,6 +680,9 @@ impl PhpLspBackend {
             }
         };
 
+        crate::dispatch::document_committed();
+        #[cfg(test)]
+        crate::dispatch::test_document_post(&uri_str, "open").await;
         self.log_trace(&format!("didOpen: {}", uri_str)).await;
         if self.current_document_state(&uri_str) != Some(document_state) {
             return;
@@ -752,6 +758,8 @@ impl PhpLspBackend {
         let extraction_version = symbol_extraction_version(request.runtime_config().php_version);
         let version = params.text_document.version;
 
+        #[cfg(test)]
+        crate::dispatch::test_document_post(&uri_str, "before_change").await;
         tracing::debug!("didChange: {} version {}", uri_str, version);
 
         // The parser entry serializes all document writers. Accept the version
@@ -902,6 +910,9 @@ impl PhpLspBackend {
             }
         };
 
+        crate::dispatch::document_committed();
+        #[cfg(test)]
+        crate::dispatch::test_document_post(&uri_str, "change").await;
         if !self
             .cancel_analyzer_run_if_current(&uri_str, document_state)
             .await
@@ -1015,6 +1026,9 @@ impl PhpLspBackend {
         self.cancel_analyzer_run_if_closed(&uri_str).await;
         self.cancel_formatter_run_if_closed(&uri_str).await;
         self.clear_semantic_tokens_if_closed(&uri_str).await;
+        crate::dispatch::document_committed();
+        #[cfg(test)]
+        crate::dispatch::test_document_post(&uri_str, "close").await;
         if let Some(token) = restore_token {
             self.restore_closed_php_index(&uri_str, token).await;
         }
@@ -1141,6 +1155,9 @@ impl PhpLspBackend {
             .await;
         self.cancel_debounced_diagnostics(params.text_document.uri.as_str())
             .await;
+        crate::dispatch::document_committed();
+        #[cfg(test)]
+        crate::dispatch::test_document_post(params.text_document.uri.as_str(), "save").await;
         self.publish_diagnostics(&params.text_document.uri).await;
         if refresh_twig_contexts {
             self.refresh_open_twig_contexts_and_republish_diagnostics()

@@ -346,6 +346,9 @@ impl PhpLspBackend {
         let mut open_symbol_cache = HashMap::new();
         let mut open_qualified_targets = HashSet::new();
         for uri in open_uris {
+            if php_lsp_parser::control::is_cancelled() {
+                return Vec::new();
+            }
             let authority = self.open_symbol_authority(&uri);
             if let OpenSymbolAuthority::Ordinary(file_symbols) = &authority {
                 open_qualified_targets.extend(
@@ -367,6 +370,7 @@ impl PhpLspBackend {
             open_symbol_cache.insert(uri, authority);
         }
         uris.into_iter()
+            .take_while(|_| !php_lsp_parser::control::is_cancelled())
             .filter_map(|uri| {
                 let mut references = self.reference_snapshot_for_scan(index, &uri)?;
                 let mut overlay = OpenReferenceOverlay {

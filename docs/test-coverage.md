@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), P2-35/P2-36/P2-37/P2-38/P2-39 (2026-10-14), and P2-40, diagnostic quick-fix metadata and Claude audit #1 document lines (2026-10-15).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), P2-35/P2-36/P2-37/P2-38/P2-39 (2026-10-14), and P2-40, diagnostic quick-fix metadata and Claude audit #1 document lines (2026-10-15), and Claude audit #2 dispatch (2026-10-16).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -14,7 +14,7 @@ Platform marks: **T** = an automated test executes the behavior on Linux;
 **M** = a Node helper test or mock-based VSIX test executes it;
 **B** = the release workflow builds a binary for that OS, without executing
 this behavior; **—** = no matching automated test or build evidence. Rust
-protocol tests mostly use an in-process LSP service; logging tests also execute
+protocol tests mostly use an in-process LSP service; logging and dispatch exit tests also execute
 the actual stdio binary. These checks do not exercise a real VS Code Extension
 Host. Linux here means the current x86-64 development host
 and Ubuntu CI, not every Linux architecture. The release build matrix has
@@ -35,6 +35,8 @@ percentages have not been remeasured.
 | Function | State / transition | Linux | macOS | Windows | Evidence and remaining gap |
 |---|---|:---:|:---:|:---:|---|
 | LSP lifecycle | initialize, initialized, shutdown | T | B | B | [initialize protocol tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
+| LSP transport responsiveness and ownership | blocked poll/light request, cancellation beyond the transport queue, queued/running/pre-start drop, ID reuse, panic, wake during poll, shutdown/exit and overload | T | B | B | [real transport barriers](../server/crates/php-lsp-server/src/dispatch_tests.rs), [stdio process exit](../server/crates/php-lsp-server/tests/e2e_dispatch.rs), [cooperative producer cancellation](../server/crates/php-lsp-parser/src/control_tests.rs). Counters/permits cover physical ownership and unread responses; the stdio regression keeps stdin open after an oversized notification. This is bounded event-order evidence, not a latency benchmark or exhaustive scheduling proof. |
+| Ordered document commits and read results | open/change/save/close post-work, version gaps, cross-file dependencies, lazy action resolve, edit/reopen during an old query | T | B | B | [real PHP backend over transport](../server/crates/php-lsp-server/src/dispatch_backend_tests.rs). Queries cannot overtake prior accepted document commits, and own-document epochs reject old responses. Existing feature-specific index/runtime guards remain necessary for later dependency changes. |
 | Server logging | initialization/live/reset, invalid values, startup directives, global scope and ordered concurrent updates | T | B | B | [filter tests](../server/crates/php-lsp-server/src/logging_tests.rs), [runtime/protocol tests](../server/crates/php-lsp-server/src/runtime_logging_tests.rs), [stdio binary tests](../server/crates/php-lsp-server/tests/e2e_logging.rs). |
 | Operation cancellation | before poll, flag-check/await race, broadcast/drop/rearm, clone isolation and concurrent registration | T | B | B | [token regressions](../server/crates/php-lsp-server/src/operation_cancellation_tests.rs), [external-command caller tests](../server/crates/php-lsp-server/src/server_tests.rs). Exact-order tests detect the original lost-wakeup mutation; bounded two-worker stress exercises 128 rounds with 16 waiters. |
 | Parser and symbol extraction | ordinary PHP, namespaces, PHPDoc | T | B | B | [parser tests](../server/crates/php-lsp-parser/src/parser_tests.rs), [symbol tests](../server/crates/php-lsp-parser/src/symbols_tests.rs); grammar-version compatibility still needs separate fixtures. |

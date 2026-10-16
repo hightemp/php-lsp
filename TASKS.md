@@ -6795,3 +6795,20 @@ change.
 - [x] **LINE-004-2026-10-15** Preserve the original finding and append completion evidence directly under item 1 in audit/CLAUDE-AUDIT-2026-10-15.md; update relevant architecture/features/testing documentation and complete this milestone. *(done 2026-10-15)*
   - Implemented: completion and evidence placed directly under audit item 1, preserving its full original wording; summary status updated. Architecture, AGENTS position rules, README, LSP/configuration/test-evidence docs and current-cache performance notes updated. Original task journal preserved; documentation links checked.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU and MemoryMax1536M/MemorySwapMax256M for builds/tests; server-package CLI debug=0 retains assertions. No parallel heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CLAUDE audit #2 Responsive LSP dispatch (2026-10-16 -> 2026-10-16)
+
+**Статус:** complete *(done 2026-10-16)*
+**Цель:** Keep transport/control requests responsive during CPU-heavy handlers, bound concurrent work and preserve document notification order without assuming consecutive LSP versions.
+
+#### Задачи
+
+- [x] **DISPATCH-001-2026-10-16** Add deterministic RED tests through real tower-lsp transport for heavy/light requests, cancellation, saturation and ordered document changes/lifetime transitions. *(done 2026-10-16)*
+  - Validation: the initial four transport tests were RED; further failing regressions exposed client-response deadlock, delayed document commits, non-cooperative producers, premature capacity release, ID reuse and stdio exit with stdin open. Positive-control cases are not counted as RED.
+- [x] **DISPATCH-002-2026-10-16** Isolate handler computation from transport polling with bounded execution/cancellation and explicit ordered document synchronization; preserve existing snapshot/generation/indexing protections. *(done 2026-10-16)*
+  - Implemented: bounded per-poll blocking execution, eager drivers, physically owned permits/admission, cancellation-safe ID reuse, notification commit fences, URI/global epoch validation and scoped cooperative parser cancellation. Mandatory notification overload ends the session; no new settings or cache schema.
+- [x] **DISPATCH-003-2026-10-16** Cover queued/running cancellation, capacity ownership, shutdown, stale results and independent documents; run focused/full sequential Rust checks and repeated gpt-6-astra Verifier to GO. *(done 2026-10-16)*
+  - Validation: 36 new tests (32 server, 3 parser, 1 real stdio); controlled barriers cover dropped/pre-start/running/unread receipts, edit/reopen, cross-file definition and lazy action resolve. Full Rust suite: 2040 PASS / 0 FAIL / 0 ignored (69 blocks); Clippy -D warnings, Rustfmt and diff check PASS. All 261 source/manifest hashes match the full-run input. Repeated read-only gpt-6-astra Verifier final GO. Artifacts: server/target/dispatcher-2026-10-16/ (ignored).
+- [x] **DISPATCH-004-2026-10-16** Update architecture/test documentation and append completion evidence directly under audit item 2, preserving its original wording and explaining the nonconsecutive-version correction. *(done 2026-10-16)*
+  - Implemented: architecture, README, LSP/test-evidence matrices and AGENTS explain the production dispatch boundary, quotas, ordering, cancellation and remaining native/codec limitations. Evidence appended directly under audit item 2; original audit and journal preserved; 224 local link targets verified. Linux checks only; no new production timing or coverage percentage.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU and MemoryMax1536M/MemorySwapMax256M for builds/tests; server-package CLI debug=0 keeps assertions. No parallel heavy checks, installed/remote server changes or automatic commit.

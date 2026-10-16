@@ -41,6 +41,15 @@ client-visible LSP behavior and known limits.
 | `workspace/willDeleteFiles` | Partial | Advertised for PHP files but currently returns no edit. |
 | `workspace/didDeleteFiles` | Supported | Removes indexed symbols for deleted PHP files. |
 
+Handler computation uses bounded workers so transport/control processing can
+continue during synchronous analysis. Document notifications are ordered before
+following document-dependent reads; valid version gaps are accepted. Ordinary
+request overload returns server busy (`-32000`); mandatory notification overflow
+or a panicking notification poll ends the session rather than continuing after a lost
+edit. Stale document responses can return ContentModified (`-32801`). Limits and
+cancellation boundaries are described in
+[transport and handler execution](architecture.md#transport-and-handler-execution).
+
 ## Navigation
 
 | LSP feature | Status | Notes |

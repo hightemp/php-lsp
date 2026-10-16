@@ -82,10 +82,16 @@ struct AbsoluteSemanticToken {
 }
 
 pub fn extract_semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticTokenData> {
+    if crate::control::is_cancelled() {
+        return Vec::new();
+    }
     let utf16_index = Utf16LineIndex::new(source);
     let mut absolute_tokens = Vec::new();
     collect_node_tokens(tree.root_node(), source, &utf16_index, &mut absolute_tokens);
 
+    if crate::control::is_cancelled() {
+        return Vec::new();
+    }
     let absolute_tokens = normalize_tokens(absolute_tokens);
     encode_relative_tokens(&absolute_tokens)
 }
@@ -96,6 +102,9 @@ fn collect_node_tokens(
     utf16_index: &Utf16LineIndex,
     tokens: &mut Vec<AbsoluteSemanticToken>,
 ) {
+    if crate::control::is_cancelled() {
+        return;
+    }
     if let Some((token_type, token_modifiers_bitset)) = classify_node(node, source) {
         push_node_tokens(
             node,
@@ -109,6 +118,9 @@ fn collect_node_tokens(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if crate::control::is_cancelled() {
+            return;
+        }
         collect_node_tokens(child, source, utf16_index, tokens);
     }
 }

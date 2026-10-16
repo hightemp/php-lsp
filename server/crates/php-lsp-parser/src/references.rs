@@ -206,7 +206,7 @@ pub fn collect_symbol_references_in_file_with_resolvers(
         file_symbols,
         resolver,
         callable_resolver,
-        &|| false,
+        &crate::control::is_cancelled,
     )
     .unwrap_or_default()
 }
@@ -475,7 +475,10 @@ fn collect_symbol_reference_node(
         }
         "object_creation_expression" => {
             let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in node
+                .named_children(&mut cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
                     push_class_reference(child, source, file_symbols, references);
                     break;
@@ -688,7 +691,10 @@ fn collect_symbol_reference_node(
         }
         "named_type" | "base_clause" | "class_interface_clause" | "attribute" => {
             let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in node
+                .named_children(&mut cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
                     push_class_reference(child, source, file_symbols, references);
                 }
@@ -706,7 +712,10 @@ fn collect_symbol_reference_node(
         }
         "trait_use_clause" => {
             let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in node
+                .named_children(&mut cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
                     push_class_reference(child, source, file_symbols, references);
                 }
@@ -715,7 +724,10 @@ fn collect_symbol_reference_node(
         "catch_clause" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let mut cursor = type_node.walk();
-                for child in type_node.named_children(&mut cursor) {
+                for child in type_node
+                    .named_children(&mut cursor)
+                    .take_while(|_| !crate::control::is_cancelled())
+                {
                     if child.kind() == "name" || child.kind() == "qualified_name" {
                         push_class_reference(child, source, file_symbols, references);
                     }
@@ -1113,6 +1125,9 @@ fn walk_for_class_refs(
     target_fqn: &str,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    if crate::control::is_cancelled() {
+        return;
+    }
     let start = node.start_position();
     let scoped_file_symbols =
         file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
@@ -1125,7 +1140,10 @@ fn walk_for_class_refs(
         "object_creation_expression" => {
             // The class name is a direct child (name or qualified_name node)
             let cursor = &mut node.walk();
-            for child in node.named_children(cursor) {
+            for child in node
+                .named_children(cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
                     check_class_name_ref(child, source, file_symbols, target_fqn, results);
                     break;
@@ -1144,7 +1162,10 @@ fn walk_for_class_refs(
         "named_type" => {
             // named_type contains a child name or qualified_name
             let cursor = &mut node.walk();
-            for child in node.named_children(cursor) {
+            for child in node
+                .named_children(cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
                     check_class_name_ref(child, source, file_symbols, target_fqn, results);
                 }
@@ -1158,7 +1179,10 @@ fn walk_for_class_refs(
         // extends/implements
         "base_clause" | "class_interface_clause" => {
             let cursor = &mut node.walk();
-            for child in node.named_children(cursor) {
+            for child in node
+                .named_children(cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
                     check_class_name_ref(child, source, file_symbols, target_fqn, results);
                 }
@@ -1176,7 +1200,10 @@ fn walk_for_class_refs(
         "catch_clause" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let cursor = &mut type_node.walk();
-                for child in type_node.named_children(cursor) {
+                for child in type_node
+                    .named_children(cursor)
+                    .take_while(|_| !crate::control::is_cancelled())
+                {
                     if child.kind() == "name" || child.kind() == "qualified_name" {
                         check_class_name_ref(child, source, file_symbols, target_fqn, results);
                     }
@@ -1193,7 +1220,10 @@ fn walk_for_class_refs(
 
     // Recurse into children
     let cursor = &mut node.walk();
-    for child in node.named_children(cursor) {
+    for child in node
+        .named_children(cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         walk_for_class_refs(child, source, file_symbols, target_fqn, results);
     }
 }
@@ -1267,6 +1297,9 @@ fn walk_for_function_refs(
     target_fqn: &str,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    if crate::control::is_cancelled() {
+        return;
+    }
     let start = node.start_position();
     let scoped_file_symbols =
         file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
@@ -1312,7 +1345,10 @@ fn walk_for_function_refs(
     }
 
     let cursor = &mut node.walk();
-    for child in node.named_children(cursor) {
+    for child in node
+        .named_children(cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         walk_for_function_refs(child, source, file_symbols, target_fqn, results);
     }
 }
@@ -1389,6 +1425,9 @@ fn walk_for_member_refs(
     target_kind: PhpSymbolKind,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    if crate::control::is_cancelled() {
+        return;
+    }
     let start = node.start_position();
     let scoped_file_symbols =
         file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
@@ -1571,7 +1610,10 @@ fn walk_for_member_refs(
     }
 
     let cursor = &mut node.walk();
-    for child in node.named_children(cursor) {
+    for child in node
+        .named_children(cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         walk_for_member_refs(
             child,
             source,
@@ -1633,6 +1675,9 @@ fn walk_for_constant_refs(
     target_fqn: &str,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    if crate::control::is_cancelled() {
+        return;
+    }
     let start = node.start_position();
     let scoped_file_symbols =
         file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
@@ -1659,7 +1704,10 @@ fn walk_for_constant_refs(
     }
 
     let cursor = &mut node.walk();
-    for child in node.named_children(cursor) {
+    for child in node
+        .named_children(cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         walk_for_constant_refs(child, source, file_symbols, target_fqn, results);
     }
 }
@@ -1672,6 +1720,9 @@ fn walk_variable_binding_refs(
     refs: &mut Vec<ReferenceLocation>,
     declarations: &mut Vec<(u32, u32, u32, u32)>,
 ) {
+    if crate::control::is_cancelled() {
+        return;
+    }
     if node.id() != scope.id() && is_class_member_body_kind(node.kind()) {
         return;
     }
@@ -1697,7 +1748,10 @@ fn walk_variable_binding_refs(
     }
 
     let cursor = &mut node.walk();
-    for child in node.named_children(cursor) {
+    for child in node
+        .named_children(cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         walk_variable_binding_refs(scope, child, source, var_name, refs, declarations);
     }
 }

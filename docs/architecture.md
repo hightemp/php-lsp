@@ -25,6 +25,75 @@ template diagnostics, and lazy vendor indexing on worker tasks. The stack size
 can be overridden with `PHP_LSP_WORKER_THREAD_STACK_SIZE` in bytes; values below
 1 MiB are ignored and the default is used.
 
+## Transport And Handler Execution
+
+`main.rs` serves stdio through `dispatch::serve`, which retains the standard
+tower-lsp codec and transport. Ordinary `LspService::call` and each handler future poll
+run on bounded blocking workers. A pending future releases its CPU permit and
+resumes only after its waker fires. This keeps synchronous parsing, inference,
+reference scans and response construction off the transport task without
+holding a CPU permit while the handler awaits I/O. Protocol frame decoding,
+intake accounting and final JSON encoding still run at the transport boundary.
+This does not eliminate every blocking operation or provide a global RSS cap.
+
+| Resource | Internal bound |
+|---|---|
+| Ordinary RPC reservations, including queued/unread responses | 16 |
+| Notification jobs, including post-processing | 128 |
+| Concurrent query polls | 2 |
+| Concurrent notification polls | 1 |
+| Concurrent lifecycle polls | 1 |
+| Ordinary retained JSON payload weight | 32 MiB; text capacities, structural weight and owned ID copies |
+| String request/cancellation IDs | 64 KiB; numeric IDs must fit LSP `integer` |
+
+Reservations survive until both physical work and the response receipt finish.
+A logically cancelled running poll retains its permit until it actually exits.
+Completed but unread responses also retain admission, preventing slow output
+from building an extra queue of computed results. Oversized/invalid IDs receive
+a bounded invalid-request response; they never enter the library pending map.
+An exhausted ordinary request budget returns `-32000` (server busy). These are
+internal limits, with no additional LSP settings or trust switches.
+
+Drivers start at intake. The transport response concurrency is greater than the
+maximum admitted RPC receipts (including shutdown); notification receipts return
+immediately. Cancellation and terminal exit bypass ordinary admission. Intake
+never waits for a notification permit, so client responses cannot deadlock
+behind notifications waiting for them. Mandatory notification count/payload
+overflow ends the session instead of dropping an incremental edit and continuing
+with divergent text. A panicking notification poll also terminates the session;
+a panicking ordinary RPC poll returns an internal error and cleans up its request ID.
+A fresh session is required after terminal overload; automatic client restart is
+not guaranteed by the server. The stdio runtime allows a one-second shutdown
+grace, since an outstanding blocking stdin read cannot be aborted by Tokio.
+
+Document notification fences are reserved at intake, before handler suspension.
+Open/change/close release the fence after authoritative parser/template/version
+and index cleanup commits; save releases after its cache/debounce preparation.
+Diagnostics, disk restoration and Twig refresh keep their existing state/run
+checks and do not hold the document fence throughout post-processing. Different
+document mutations have independent fences. Document-dependent queries wait
+for previously accepted document commits, including cross-file dependencies;
+this may queue ordinary queries behind a pending mutation.
+
+Response validation checks intake epochs for the request's document URIs,
+including code-action/completion resolve and hierarchy payloads. Workspace
+symbols and legacy completion resolve without a URI use a global document
+epoch. This rejects own-document edit/reopen races; it is not an atomic workspace
+snapshot or a replacement for feature-specific index/runtime/provenance guards
+when other dependencies change later. LSP versions need only increase; gaps are
+valid and are never interpreted as a lost notification. Reused request IDs wait
+for the previous incarnation's physical cleanup, including cancellation before
+the new driver first runs, to prevent late library cleanup from touching a new
+request with the same ID.
+
+Read-only RPC polls use `php-lsp-parser/src/control.rs` to propagate cooperative
+cancellation to symbol/reference/token traversal and inference budgets. The
+scope is restored on return/unwind and does not carry into mutation or indexing
+workers. Cancelled snapshots and semantic-token results are discarded. Native
+calls and other indivisible synchronous sections may finish their current poll;
+there is no unsafe thread preemption. Existing filesystem/analyzer worker
+budgets and cancellation ownership remain separate.
+
 ## Server Crate Layout
 
 The server crate is intentionally split by operational area. New code should
@@ -33,6 +102,7 @@ prefer the focused module for its feature instead of growing `server.rs`.
 ```text
 server/crates/php-lsp-server/src/
   server.rs                  # PhpLspBackend state, shared helpers, LanguageServer delegation
+  dispatch.rs                # bounded polling, cancellation, intake budgets and document fences
   config.rs                  # effective VS Code/global/project configuration
   logging.rs                 # owned reloadable subscriber filter and startup restoration
   analyze.rs                 # analyze CLI
@@ -135,6 +205,7 @@ and response helpers live in `tests/support/mod.rs`.
 | Test target | Covers |
 |---|---|
 | `tests/e2e_initialize.rs` | initialize/shutdown, runtime configuration, project config trust. |
+| `tests/e2e_dispatch.rs` | real stdio process termination on overload while client stdin remains open; bounded runtime shutdown. |
 | `tests/e2e_logging.rs` | real stdio binary stderr filtering, initialization overrides, inherited/invalid RUST_LOG and separate CLI stdout. |
 | `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
 | `tests/e2e_document_lines.rs` | exact incremental text and complete coordinate conversion for LF/CRLF/CR, Unicode separators, navigation/edits/diagnostics/tokens/templates and external-edit guards. |

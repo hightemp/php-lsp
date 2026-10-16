@@ -393,6 +393,8 @@ impl PhpLspBackend {
             return Ok(None);
         };
 
+        #[cfg(test)]
+        crate::dispatch::test_document_post(&uri_str, "symbols_ready").await;
         // Build hierarchical DocumentSymbol tree
         let mut top_level: Vec<DocumentSymbol> = Vec::new();
 

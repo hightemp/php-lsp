@@ -22,8 +22,12 @@ pub(super) fn semantic_tokens_legend() -> SemanticTokensLegend {
 fn semantic_tokens_for_parser(parser: &FileParser) -> Option<Vec<SemanticToken>> {
     let tree = parser.tree()?;
     let source = parser.source();
+    let tokens = extract_semantic_tokens(tree, &source);
+    if php_lsp_parser::control::is_cancelled() {
+        return None;
+    }
     Some(
-        extract_semantic_tokens(tree, &source)
+        tokens
             .into_iter()
             .map(|token| SemanticToken {
                 delta_line: token.delta_line,

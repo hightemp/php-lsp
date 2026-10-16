@@ -328,6 +328,9 @@ where
         extract_file_symbols(&tree, &source, uri_str)
     };
 
+    if php_lsp_parser::control::is_cancelled() {
+        return None;
+    }
     Some(OpenDocumentSnapshot {
         tree,
         source,
@@ -1288,7 +1291,7 @@ impl OperationCancellationToken {
         Arc::ptr_eq(&self.cancelled, &other.cancelled)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         self.cancelled_with_after_check(|| {}).await;
     }
 

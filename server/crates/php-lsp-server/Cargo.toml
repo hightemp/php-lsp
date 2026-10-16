@@ -16,6 +16,8 @@ name = "php-lsp"
 path = "src/main.rs"
 
 [dependencies]
+tower = "0.5"
+futures = "0.3"
 php-lsp-types = { workspace = true }
 php-lsp-parser = { workspace = true }
 php-lsp-index = { workspace = true }
@@ -37,7 +39,3 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
-
-[dev-dependencies]
-tower = "0.5"
-futures = "0.3"

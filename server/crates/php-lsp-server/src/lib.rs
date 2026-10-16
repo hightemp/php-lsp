@@ -4,6 +4,7 @@
 
 pub mod analyze;
 pub mod config;
+pub mod dispatch;
 pub mod fix;
 mod framework;
 pub mod logging;

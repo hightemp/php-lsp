@@ -8,12 +8,13 @@ use php_lsp_server::config::{
 use php_lsp_server::logging::RuntimeLogFilter;
 use php_lsp_server::PhpLspBackend;
 use std::path::PathBuf;
-use tower_lsp::{LspService, Server};
+use tower_lsp::LspService;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_WORKER_THREAD_STACK_SIZE: usize = 1024 * 1024;
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 const WORKER_THREAD_STACK_SIZE_ENV: &str = "PHP_LSP_WORKER_THREAD_STACK_SIZE";
 
 fn main() {
@@ -24,6 +25,9 @@ fn main() {
         .expect("failed to build php-lsp Tokio runtime");
 
     runtime.block_on(async_main());
+    // Tokio's blocking stdin read cannot be aborted. Transport exit/overflow
+    // must still end this process if the client keeps its write end open.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
 }
 
 async fn async_main() {
@@ -52,7 +56,7 @@ async fn async_main() {
     let (service, socket) =
         LspService::new(move |client| PhpLspBackend::with_log_filter(client, log_filter.clone()));
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    php_lsp_server::dispatch::serve(stdin, stdout, service, socket).await;
 }
 
 fn worker_thread_stack_size() -> usize {

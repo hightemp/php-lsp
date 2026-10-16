@@ -40,6 +40,10 @@ pub(super) fn begin() {
 }
 
 pub(super) fn consume() -> bool {
+    if crate::control::is_cancelled() {
+        exhaust();
+        return false;
+    }
     WORK.with(|work| {
         let mut state = work.get();
         if state.exhausted {
@@ -123,6 +127,9 @@ impl FileInferenceBudget {
         let mut scopes = 1usize;
         let mut cursor = root.walk();
         loop {
+            if crate::control::is_cancelled() {
+                return Self::with_scopes(scopes);
+            }
             if crate::variable_scope::is_callable_scope(cursor.node()) {
                 scopes = scopes.saturating_add(1);
             }

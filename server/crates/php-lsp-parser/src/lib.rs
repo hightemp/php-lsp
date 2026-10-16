@@ -3,6 +3,7 @@
 //! Wraps tree-sitter-php for incremental parsing and provides
 //! symbol extraction, diagnostic generation, and symbol resolution from CST.
 
+pub mod control;
 mod cst;
 pub mod diagnostics;
 pub mod function_names;

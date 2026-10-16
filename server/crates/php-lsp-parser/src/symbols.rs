@@ -51,9 +51,15 @@ pub(crate) fn extract_root_symbols(
     uri: &str,
     php_version: Option<PhpSymbolExtractionVersion>,
 ) -> FileSymbols {
+    if crate::control::is_cancelled() {
+        return FileSymbols::default();
+    }
     let mut result = FileSymbols::default();
     let mut root_cursor = root.walk();
-    let children: Vec<Node<'_>> = root.children(&mut root_cursor).collect();
+    let children: Vec<Node<'_>> = root
+        .children(&mut root_cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+        .collect();
     let has_namespace_declarations = children.iter().any(|child| {
         child.kind() == "namespace_definition"
             && crate::resolve::namespace_relative_function_call(*child, source).is_none()
@@ -104,6 +110,9 @@ pub(crate) fn extract_root_symbols(
     // declaration (or EOF), not merely to the declaration's semicolon.
     let mut current_ns: Option<String> = None;
     for child in children.iter().copied() {
+        if crate::control::is_cancelled() {
+            return FileSymbols::default();
+        }
         match child.kind() {
             "namespace_definition"
                 if crate::resolve::namespace_relative_function_call(child, source).is_none() =>
@@ -124,10 +133,16 @@ pub(crate) fn extract_root_symbols(
         }
     }
 
+    if crate::control::is_cancelled() {
+        return FileSymbols::default();
+    }
     // Declaration helpers stage exact CST byte ranges. Convert once per file,
     // preserving the first-line UTF-16 prefix needed by template consumers.
     let utf16 = crate::utf16::Utf16LineIndex::new(source);
     for symbol in &mut result.symbols {
+        if crate::control::is_cancelled() {
+            return FileSymbols::default();
+        }
         if let Some((line, column, end_line, end_column)) = symbol.doc_comment_range {
             symbol.doc_comment_range =
                 Some(utf16.range_to_lsp((line, column, end_line, end_column)));
@@ -135,6 +150,9 @@ pub(crate) fn extract_root_symbols(
     }
     let snapshot = result.clone();
     for symbol in &mut result.symbols {
+        if crate::control::is_cancelled() {
+            return FileSymbols::default();
+        }
         crate::type_contract::select_signature_types(symbol, &snapshot);
     }
     result
@@ -144,7 +162,10 @@ fn extract_file_level_phpdoc_aliases(root: Node, source: &str, result: &mut File
     collect_file_level_phpdoc_aliases(root, source, result);
 
     let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
+    for child in root
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "namespace_definition" {
             if let Some(body) = child.child_by_field_name("body") {
                 collect_file_level_phpdoc_aliases(body, source, result);
@@ -155,7 +176,10 @@ fn extract_file_level_phpdoc_aliases(root: Node, source: &str, result: &mut File
 
 fn collect_file_level_phpdoc_aliases(node: Node, source: &str, result: &mut FileSymbols) {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() != "comment" {
             continue;
         }
@@ -236,7 +260,10 @@ fn phpdoc_comment_belongs_to_declaration(comment: Node) -> bool {
 /// The name is in a `namespace_name` child (not field "name").
 fn find_namespace_name(node: Node, source: &str) -> Option<String> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "namespace_name" {
             return Some(node_text(child, source).to_string());
         }
@@ -322,7 +349,10 @@ fn extract_children(
     php_version: Option<PhpSymbolExtractionVersion>,
 ) {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         extract_from_node(child, source, uri, result, current_ns, php_version);
     }
 }
@@ -337,7 +367,10 @@ fn extract_use_statements(
     let declaration_kind = determine_use_kind(node, source);
 
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "namespace_use_clause" {
             let clause_kind = use_clause_kind(child, source).unwrap_or(declaration_kind);
             extract_single_use_clause(child, source, result, clause_kind, current_ns);
@@ -361,7 +394,10 @@ fn extract_single_use_clause(
     let mut saw_as = false;
 
     let mut cursor = clause.walk();
-    for child in clause.children(&mut cursor) {
+    for child in clause
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         match child.kind() {
             "qualified_name" | "namespace_name" | "name" if !saw_as => {
                 fqn = Some(node_text(child, source).to_string());
@@ -413,7 +449,10 @@ fn extract_use_group(
         .unwrap_or_default();
 
     let mut cursor = group.walk();
-    for clause in group.named_children(&mut cursor) {
+    for clause in group
+        .named_children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if clause.kind() != "namespace_use_clause" {
             continue;
         }
@@ -495,10 +534,16 @@ fn resolve_class_name_in_file(name: &str, file_symbols: &FileSymbols) -> String 
 fn extract_base_clause(node: Node, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
     let mut result = Vec::new();
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "base_clause" {
             let mut inner_cursor = child.walk();
-            for inner in child.children(&mut inner_cursor) {
+            for inner in child
+                .children(&mut inner_cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 match inner.kind() {
                     "name" | "qualified_name" => {
                         let name = node_text(inner, source);
@@ -516,10 +561,16 @@ fn extract_base_clause(node: Node, source: &str, file_symbols: &FileSymbols) -> 
 fn extract_interface_clause(node: Node, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
     let mut result = Vec::new();
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "class_interface_clause" {
             let mut inner_cursor = child.walk();
-            for inner in child.children(&mut inner_cursor) {
+            for inner in child
+                .children(&mut inner_cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 match inner.kind() {
                     "name" | "qualified_name" => {
                         let name = node_text(inner, source);
@@ -555,13 +606,19 @@ fn class_body_node(node: Node) -> Option<Node> {
 fn extract_trait_use_clauses(body: Node, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
     let mut result = Vec::new();
     let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
+    for child in body
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() != "use_declaration" {
             continue;
         }
 
         let mut inner_cursor = child.walk();
-        for inner in child.children(&mut inner_cursor) {
+        for inner in child
+            .children(&mut inner_cursor)
+            .take_while(|_| !crate::control::is_cancelled())
+        {
             match inner.kind() {
                 "name" | "qualified_name" => {
                     let name = node_text(inner, source);
@@ -960,7 +1017,10 @@ fn extract_class_body(
     php_version: Option<PhpSymbolExtractionVersion>,
 ) {
     let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
+    for child in body
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         match child.kind() {
             "method_declaration" => {
                 extract_method(child, source, uri, result, parent_fqn, php_version);
@@ -1048,7 +1108,10 @@ fn extract_method(
     // so that `$this->prop` can be resolved to its type.
     if let Some(param_list) = node.child_by_field_name("parameters") {
         let mut cursor = param_list.walk();
-        for child in param_list.children(&mut cursor) {
+        for child in param_list
+            .children(&mut cursor)
+            .take_while(|_| !crate::control::is_cancelled())
+        {
             if child.kind() == "property_promotion_parameter" {
                 if !node_is_available_for_php_version(child, source, php_version) {
                     continue;
@@ -1200,7 +1263,10 @@ fn extract_properties(
         });
 
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "property_element" {
             if let Some(name_node) = child.child_by_field_name("name") {
                 let raw_name = node_text(name_node, source);
@@ -1449,7 +1515,10 @@ fn extract_class_constants(
     let attributes = attribute_groups_for_node(node, source);
 
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "const_element" {
             // Find name: first "name" child (may not be a field)
             let name_node = child.child_by_field_name("name").or_else(|| {
@@ -1514,7 +1583,10 @@ fn extract_global_constants(
     let attributes = attribute_groups_for_node(node, source);
 
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "const_element" {
             let name_node = child.child_by_field_name("name").or_else(|| {
                 (0..child.child_count())
@@ -1920,7 +1992,10 @@ fn extract_signature(
 
     if let Some(param_list) = node.child_by_field_name("parameters") {
         let mut cursor = param_list.walk();
-        for child in param_list.children(&mut cursor) {
+        for child in param_list
+            .children(&mut cursor)
+            .take_while(|_| !crate::control::is_cancelled())
+        {
             if child.kind() == "simple_parameter"
                 || child.kind() == "variadic_parameter"
                 || child.kind() == "property_promotion_parameter"
@@ -2027,7 +2102,10 @@ fn parse_type_node(node: Node, source: &str) -> TypeInfo {
         "union_type" => {
             let mut types = Vec::new();
             let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
+            for child in node
+                .children(&mut cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() != "|" {
                     types.push(parse_type_node(child, source));
                 }
@@ -2037,7 +2115,10 @@ fn parse_type_node(node: Node, source: &str) -> TypeInfo {
         "intersection_type" => {
             let mut types = Vec::new();
             let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
+            for child in node
+                .children(&mut cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if child.kind() != "&" {
                     types.push(parse_type_node(child, source));
                 }
@@ -2278,7 +2359,10 @@ fn make_fqn(namespace: &Option<String>, name: &str) -> String {
 
 fn extract_visibility(node: Node, source: &str) -> Visibility {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         if child.kind() == "visibility_modifier" {
             return match node_text(child, source) {
                 "public" => Visibility::Public,
@@ -2294,7 +2378,10 @@ fn extract_visibility(node: Node, source: &str) -> Visibility {
 fn extract_modifiers(node: Node, _source: &str) -> SymbolModifiers {
     let mut mods = SymbolModifiers::default();
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         match child.kind() {
             "static_modifier" => mods.is_static = true,
             "abstract_modifier" => mods.is_abstract = true,
@@ -2361,9 +2448,15 @@ fn declaration_is_deprecated(
     }
     for list in lists {
         let mut list_cursor = list.walk();
-        for group in list.named_children(&mut list_cursor) {
+        for group in list
+            .named_children(&mut list_cursor)
+            .take_while(|_| !crate::control::is_cancelled())
+        {
             let mut group_cursor = group.walk();
-            for attribute in group.named_children(&mut group_cursor) {
+            for attribute in group
+                .named_children(&mut group_cursor)
+                .take_while(|_| !crate::control::is_cancelled())
+            {
                 if attribute.kind() != "attribute" {
                     continue;
                 }
@@ -2401,7 +2494,10 @@ fn find_doc_comment_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
     let mut leading_doc = None;
     let mut saw_leading_comment = false;
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node
+        .children(&mut cursor)
+        .take_while(|_| !crate::control::is_cancelled())
+    {
         match child.kind() {
             "attribute_list" => {}
             "comment" => {

@@ -221,6 +221,10 @@ phpstorm-stubs support.
 
 ## Known Limitations
 
+- Handler computation uses bounded workers and ordered document synchronization.
+  Bursts beyond request capacity return server busy; an exhausted mandatory
+  notification backlog ends the session and requires resynchronization in a new
+  session. See [runtime limits](docs/architecture.md#transport-and-handler-execution).
 - The latest large-workspace production baseline remains the IDE intelligence
   refresh (2026-05-28). It measures a primary 10k-file Symfony workspace and
   two additional Laravel-like workspaces. Later per-feature behavior is tracked
